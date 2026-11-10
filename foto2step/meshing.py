@@ -66,6 +66,16 @@ def poisson_mesh(pc, voxel, depth=0, trim_dist=None, density_q=0.02):
     return mesh
 
 
+def cap_triangles(mesh, n_max):
+    """Light QEM decimation to keep memory bounded (Poisson output is heavily oversampled)."""
+    if n_max and len(mesh.triangles) > n_max:
+        n0 = len(mesh.triangles)
+        mesh = mesh.simplify_quadric_decimation(int(n_max))
+        mesh = clean_mesh(mesh, min_component_frac=0, min_component_tris=0)
+        log(f"  werk-mesh: {n0:,} -> {len(mesh.triangles):,} driehoeken")
+    return mesh
+
+
 def clean_mesh(mesh, min_component_frac=0.002, min_component_tris=50):
     mesh.remove_degenerate_triangles()
     mesh.remove_duplicated_triangles()
@@ -95,25 +105,27 @@ def arrays_to_mesh(V, F):
 
 
 def decimate_bounded(mesh, max_err_mm=0.15, max_tris=400000, ref_pts=None):
-    """Quadric decimation, halving until the max deviation (sampled) exceeds max_err_mm."""
+    """Quadric decimation: reduce as far as possible while the deviation (99.9% quantile) stays <= max_err_mm."""
     if ref_pts is None:
-        ref = mesh.sample_points_uniformly(min(200000, max(20000, len(mesh.triangles) * 2)))
+        ref = mesh.sample_points_uniformly(min(300000, max(20000, len(mesh.triangles) * 2)))
         ref_pts = np.asarray(ref.points)
-    best = mesh
     n = len(mesh.triangles)
+    best = mesh
+    best_err = 0.0
     target = n
-    while target > 2000:
-        target = int(target * 0.6)
+    while target > 1000:
+        target = int(target * 0.7)
         cand = mesh.simplify_quadric_decimation(target)
         err = _max_dev(cand, ref_pts)
-        if err > max_err_mm and len(best.triangles) <= max_tris:
+        if err > max_err_mm:
             break
-        best = cand
+        best, best_err = cand, err
     if len(best.triangles) > max_tris:
         best = mesh.simplify_quadric_decimation(max_tris)
-        log(f"  WAARSCHUWING: driehoekslimiet {max_tris} bereikt, afwijking {_max_dev(best, ref_pts):.3f} mm")
+        best_err = _max_dev(best, ref_pts)
+        log(f"  WAARSCHUWING: driehoekslimiet {max_tris:,} bereikt, afwijking {best_err:.3f} mm")
     best = clean_mesh(best, min_component_frac=0, min_component_tris=0)
-    log(f"  decimatie: {n:,} -> {len(best.triangles):,} driehoeken (max afwijking {_max_dev(best, ref_pts):.3f} mm)")
+    log(f"  decimatie: {n:,} -> {len(best.triangles):,} driehoeken (afwijking 99,9%: {best_err:.3f} mm)")
     return best
 
 

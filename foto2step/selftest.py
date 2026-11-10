@@ -32,12 +32,13 @@ def _dist_to_mesh(pts, mesh_tm):
     return sc.compute_distance(o3d.core.Tensor(np.asarray(pts, np.float32))).numpy()
 
 
-def grade(ds: Path, work: Path, out: Path) -> dict:
+def grade(ds: Path, work: Path, out: Path, T=None, sfm=True) -> dict:
     gt = json.loads((ds / "gt.json").read_text())
     cfg = yaml.safe_load((ds / "config.yaml").read_text())
     from .config import _merge, DEFAULTS
     cfg = _merge(DEFAULTS, cfg)
-    T = _gt_world_T(gt, cfg["markers"])
+    if T is None:
+        T = _gt_world_T(gt, cfg["markers"])
     R = {"checks": []}
 
     def check(name, value, limit, unit="mm", higher_better=False):
@@ -47,7 +48,7 @@ def grade(ds: Path, work: Path, out: Path) -> dict:
 
     states = [s["name"] for s in cfg["states"]]
     # 1. markers
-    for s in states:
+    for s in (states if sfm else []):
         est = json.loads((work / s / "markers_world.json").read_text())
         g = gt["states"][s]["marker_corners"]
         errs = []

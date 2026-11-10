@@ -98,6 +98,7 @@ class Pipeline:
             log(f"  oppervlakteruis ~{noise:.3f} mm (RMS)")
             o3d.io.write_point_cloud(str(d / "cloud_clean.ply"), pc)
             mesh = meshing.poisson_mesh(pc, cm["voxel_mm"], cm["poisson_depth"], density_q=cm["density_trim_quantile"])
+            mesh = meshing.cap_triangles(mesh, int(cm.get("working_triangles", 1200000)) // 2)
             o3d.io.write_triangle_mesh(str(d / "mesh_full.ply"), mesh)
             (d / "noise.json").write_text(json.dumps({"noise_mm": noise}))
 
@@ -199,15 +200,16 @@ class Pipeline:
             pc.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=4 * cm["voxel_mm"], max_nn=40))
             self._orient_normals(pc, h, info)
             mesh = meshing.poisson_mesh(pc, cm["voxel_mm"], cm["poisson_depth"], density_q=cm["density_trim_quantile"])
+            mesh = meshing.cap_triangles(mesh, int(cm.get("working_triangles", 1200000)))
             if b.get("static") and cm.get("remove_floor", True):
-                mesh = _clamp_floor(mesh, cm["floor_clearance_mm"] + 2 * cm["voxel_mm"])
-            mesh = _fill(mesh, hole_mm=float(cm.get("fill_holes_mm", 400.0)))
+                mesh = _clamp_floor(mesh, cm["floor_clearance_mm"] + 4 * cm["voxel_mm"])
+            mesh = _fill(mesh, hole_mm=float(cm.get("fill_holes_mm", 3000.0)))
             feat = {}
             if self.cfg["features"].get("enable", True):
                 mesh, feat = regularize_mesh(mesh, noise, self.cfg["features"])
             ref_pts = np.asarray(pc.points)
             dec = meshing.decimate_bounded(mesh, max(cm["target_max_error_mm"], 0.05), cm["max_triangles"])
-            dec = _fill(dec, hole_mm=float(cm.get("fill_holes_mm", 400.0)))
+            dec = _fill(dec, hole_mm=float(cm.get("fill_holes_mm", 3000.0)))
             # accuracy: measured points -> final surface
             acc = _surface_dev(dec, ref_pts)
             o3d.io.write_triangle_mesh(str(self.work / "bodies" / f"{h:02d}_{name}_final.ply"), dec)

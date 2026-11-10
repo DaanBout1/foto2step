@@ -17,43 +17,64 @@ def _occ():
     return BRepBuilderAPI, BRep, TopoDS, gp, ShapeUpgrade, ShapeFix, BRepCheck, TopAbs, TopExp
 
 
-def mesh_to_shape(V: np.ndarray, F: np.ndarray, merge_coplanar=True, lin_tol=0.01, ang_tol_deg=0.5):
-    """Return (TopoDS_Shape, info). Solid if mesh is closed & manifold, otherwise shell."""
+def mesh_to_shape(V: np.ndarray, F: np.ndarray, merge_coplanar=True, plane_tol=0.005, ang_tol_deg=0.2):
+    """Return (TopoDS_Shape, info). Solid if mesh is closed & manifold, otherwise shell.
+
+    Coplanar triangle groups become ONE planar B-rep face (outer loop + holes) built from the same
+    shared edges as their neighbours, so the result is a clean, light B-rep without sewing.
+    """
     BRepBuilderAPI, BRep, TopoDS, gp, ShapeUpgrade, ShapeFix, BRepCheck, TopAbs, TopExp = _occ()
     V = np.asarray(V, float)
     F = np.asarray(F, np.int64)
-    # drop degenerate triangles
     tri = V[F]
     ar = np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1)
     F = F[ar > 1e-8]
-    verts = [BRepBuilderAPI.BRepBuilderAPI_MakeVertex(gp.gp_Pnt(*map(float, p))).Vertex() for p in V]
+    verts = {}
+
+    def vert(i):
+        v = verts.get(i)
+        if v is None:
+            v = BRepBuilderAPI.BRepBuilderAPI_MakeVertex(gp.gp_Pnt(*map(float, V[i]))).Vertex()
+            verts[i] = v
+        return v
+
     edges = {}
 
     def edge(a, b):
         key = (a, b) if a < b else (b, a)
         e = edges.get(key)
         if e is None:
-            e = BRepBuilderAPI.BRepBuilderAPI_MakeEdge(verts[key[0]], verts[key[1]]).Edge()
+            e = BRepBuilderAPI.BRepBuilderAPI_MakeEdge(vert(key[0]), vert(key[1])).Edge()
             edges[key] = e
         return e
 
+    groups = []
+    if merge_coplanar and len(F) > 1:
+        groups = _coplanar_groups(V, F, plane_tol, ang_tol_deg)
+    in_group = np.zeros(len(F), bool)
     builder = BRep.BRep_Builder()
     shell = TopoDS.TopoDS_Shell()
     builder.MakeShell(shell)
     n_fail = 0
-    for a, b, c in F:
+    n_planar = 0
+    for faces, normal in groups:
+        face = _planar_face(V, F[faces], normal, edge, BRepBuilderAPI, gp, ShapeFix)
+        if face is None:
+            continue
+        builder.Add(shell, face)
+        in_group[faces] = True
+        n_planar += 1
+    for a, b, c in F[~in_group]:
         try:
             mw = BRepBuilderAPI.BRepBuilderAPI_MakeWire(edge(a, b), edge(b, c), edge(c, a))
             if not mw.IsDone():
                 n_fail += 1
                 continue
-            w = mw.Wire()
-            mf = BRepBuilderAPI.BRepBuilderAPI_MakeFace(w, True)
+            mf = BRepBuilderAPI.BRepBuilderAPI_MakeFace(mw.Wire(), True)
             if not mf.IsDone():
                 n_fail += 1
                 continue
             face = mf.Face()
-            # make face orientation follow triangle winding
             n_tri = np.cross(V[b] - V[a], V[c] - V[a])
             n_face = _face_normal(face)
             if n_face is not None and np.dot(n_face, n_tri) < 0:
@@ -74,16 +95,6 @@ def mesh_to_shape(V: np.ndarray, F: np.ndarray, merge_coplanar=True, lin_tol=0.0
             kind = "solid"
         except Exception as e:
             log(f"  WAARSCHUWING: solid maken mislukt ({e}); schil wordt geschreven")
-    n_faces_before = len(F)
-    if merge_coplanar:
-        try:
-            u = ShapeUpgrade.ShapeUpgrade_UnifySameDomain(shape, True, True, False)
-            u.SetLinearTolerance(lin_tol)
-            u.SetAngularTolerance(np.radians(ang_tol_deg))
-            u.Build()
-            shape = u.Shape()
-        except Exception as e:
-            log(f"  WAARSCHUWING: vlakken samenvoegen mislukt ({e})")
     nf = _count(shape, TopAbs.TopAbs_FACE)
     valid = BRepCheck.BRepCheck_Analyzer(shape).IsValid()
     if not valid:
@@ -94,9 +105,127 @@ def mesh_to_shape(V: np.ndarray, F: np.ndarray, merge_coplanar=True, lin_tol=0.0
             valid = BRepCheck.BRepCheck_Analyzer(shape).IsValid()
         except Exception:
             pass
-    info = {"kind": kind, "triangles": int(n_faces_before), "brep_faces": int(nf), "failed_triangles": n_fail,
-            "valid": bool(valid), "closed_mesh": bool(closed)}
+    info = {"kind": kind, "triangles": int(len(F)), "brep_faces": int(nf), "planar_faces": n_planar,
+            "failed_triangles": n_fail, "valid": bool(valid), "closed_mesh": bool(closed)}
     return shape, info
+
+
+def _coplanar_groups(V, F, tol, ang_deg, min_tris=2):
+    """Connected groups of (numerically) coplanar triangles: [(face_idx_array, normal)]."""
+    from .features import face_adjacency
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+    tri = V[F]
+    n = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    n /= np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-15)
+    adj = face_adjacency(F)
+    c = (n[adj[:, 0]] * n[adj[:, 1]]).sum(1)
+    ok = c > np.cos(np.radians(ang_deg))
+    # vertex of neighbour on plane of face
+    ca = tri[adj[:, 0]].mean(1)
+    dist = np.abs(((tri[adj[:, 1]] - ca[:, None, :]) * n[adj[:, 0]][:, None, :]).sum(2)).max(1)
+    ok &= dist < tol
+    A = coo_matrix((np.ones(ok.sum()), (adj[ok, 0], adj[ok, 1])), shape=(len(F), len(F)))
+    _, comp = connected_components(A, directed=False)
+    out = []
+    order = np.argsort(comp, kind="stable")
+    cs = comp[order]
+    starts = np.r_[0, np.where(np.diff(cs))[0] + 1, len(cs)]
+    for s, e in zip(starts[:-1], starts[1:]):
+        if e - s < min_tris:
+            continue
+        faces = order[s:e]
+        w = np.linalg.norm(np.cross(tri[faces, 1] - tri[faces, 0], tri[faces, 2] - tri[faces, 0]), axis=1)
+        nn = (n[faces] * w[:, None]).sum(0)
+        nn /= np.linalg.norm(nn)
+        # global flatness check (growing with local tolerance can drift on gently curved surfaces)
+        pts = tri[faces].reshape(-1, 3)
+        d = pts @ nn
+        if np.ptp(d) > max(4 * tol, 0.02):
+            continue
+        out.append((faces, nn))
+    return out
+
+
+def _boundary_loops(Fg):
+    """Directed boundary loops of a triangle group (list of vertex index lists) or None if ambiguous."""
+    e = np.vstack([Fg[:, [0, 1]], Fg[:, [1, 2]], Fg[:, [2, 0]]])
+    key = {}
+    for a, b in e:
+        key[(a, b)] = key.get((a, b), 0) + 1
+    bnd = [(a, b) for (a, b) in key if (b, a) not in key]
+    if not bnd:
+        return []
+    nxt = {}
+    for a, b in bnd:
+        nxt.setdefault(a, []).append(b)
+    loops = []
+    used = set()
+    for a0, b0 in bnd:
+        if (a0, b0) in used:
+            continue
+        loop = [a0]
+        a, b = a0, b0
+        guard = 0
+        while True:
+            used.add((a, b))
+            if b == a0:
+                break
+            loop.append(b)
+            cands = [c for c in nxt.get(b, []) if (b, c) not in used]
+            if not cands:
+                return None
+            a, b = b, cands[0]
+            guard += 1
+            if guard > len(bnd) + 5:
+                return None
+        loops.append(loop)
+    return loops
+
+
+def _planar_face(V, Fg, normal, edge, BRepBuilderAPI, gp, ShapeFix):
+    loops = _boundary_loops(Fg)
+    if not loops:
+        return None
+    # signed areas w.r.t. normal
+    def sarea(lp):
+        P = V[lp]
+        return 0.5 * np.cross(P - P[0], np.roll(P, -1, 0) - P[0]).sum(0) @ normal
+    areas = [sarea(lp) for lp in loops]
+    k = int(np.argmax(areas))
+    if areas[k] <= 0:
+        return None
+    if sum(1 for a in areas if a > 0) > 1:
+        return None  # several outer loops (pinched region): keep triangles
+    c = V[np.unique(Fg)].mean(0)
+    pln = gp.gp_Pln(gp.gp_Pnt(*map(float, c)), gp.gp_Dir(*map(float, normal)))
+
+    def wire(lp):
+        mw = BRepBuilderAPI.BRepBuilderAPI_MakeWire()
+        for i in range(len(lp)):
+            mw.Add(edge(lp[i], lp[(i + 1) % len(lp)]))
+        if not mw.IsDone():
+            raise RuntimeError("wire")
+        return mw.Wire()
+
+    try:
+        mf = BRepBuilderAPI.BRepBuilderAPI_MakeFace(pln, wire(loops[k]), True)
+        for i, lp in enumerate(loops):
+            if i != k:
+                mf.Add(wire(lp))
+        if not mf.IsDone():
+            return None
+        face = mf.Face()
+        fx = ShapeFix.ShapeFix_Face(face)
+        fx.FixOrientation()
+        fx.Perform()
+        face = _as_face(fx.Face())
+        n_face = _face_normal(face)
+        if n_face is not None and n_face @ normal < 0:
+            face = _as_face(face.Reversed())
+        return face
+    except Exception:
+        return None
 
 
 def _as_face(shape):
@@ -189,7 +318,9 @@ def write_step(parts: list, path: Path, assembly_name="machine"):
     w = STEPCAFControl_Writer()
     w.SetNameMode(True)
     w.SetColorMode(True)
-    if not w.Transfer(doc, STEPControl_AsIs):
+    with _quiet():
+        ok = w.Transfer(doc, STEPControl_AsIs)
+    if not ok:
         raise RuntimeError("STEP transfer mislukt")
     with _quiet():
         status = w.Write(str(path))

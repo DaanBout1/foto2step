@@ -109,6 +109,7 @@ def detect_regions(V, F, tol_mm, angle_deg=12.0, min_area=400.0, cylinders=True)
         n, d, rms = fit_plane(pts, np.repeat(area[m], 3))
         regions.append({"type": "plane", "normal": n, "d": d, "rms": rms, "area": float(area[m].sum()), "faces": m})
     labels[labels == -2] = -1
+    _merge_coplanar(labels, regions, tri, area, tol_mm)
     # ---------------- cylinders on remaining smooth patches
     if cylinders:
         free = labels == -1
@@ -146,87 +147,143 @@ def detect_regions(V, F, tol_mm, angle_deg=12.0, min_area=400.0, cylinders=True)
     return labels, regions
 
 
+def _merge_coplanar(labels, regions, tri, area, tol_mm, ang_deg=2.0):
+    """Merge plane regions that describe the same plane (over-segmentation by noise)."""
+    ids = [i for i, r in enumerate(regions) if r is not None and r["type"] == "plane"]
+    if len(ids) < 2:
+        return
+    parent = {i: i for i in ids}
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    cos_a = np.cos(np.radians(ang_deg))
+    for a_i, i in enumerate(ids):
+        ri = regions[i]
+        for j in ids[a_i + 1:]:
+            rj = regions[j]
+            c = ri["normal"] @ rj["normal"]
+            if abs(c) < cos_a:
+                continue
+            sg = 1.0 if c > 0 else -1.0
+            if abs(ri["d"] - sg * rj["d"]) > tol_mm * 0.5:
+                continue
+            # check: points of j lie on plane i within tolerance
+            pj = tri[rj["faces"]].reshape(-1, 3)
+            if np.quantile(np.abs(pj @ ri["normal"] + ri["d"]), 0.95) > tol_mm:
+                continue
+            parent[find(j)] = find(i)
+    groups = {}
+    for i in ids:
+        groups.setdefault(find(i), []).append(i)
+    for root, mem in groups.items():
+        if len(mem) == 1:
+            continue
+        faces = np.concatenate([regions[k]["faces"] for k in mem])
+        pts = tri[faces].reshape(-1, 3)
+        n, d, rms = fit_plane(pts, np.repeat(area[faces], 3))
+        regions[root] = {"type": "plane", "normal": n, "d": d, "rms": rms, "area": float(area[faces].sum()), "faces": faces}
+        labels[faces] = root
+        for k in mem:
+            if k != root:
+                regions[k] = None
+
+
 def snap(V, F, labels, regions, max_move, sharpen=True):
-    """Project vertices onto detected surfaces; sharpen plane-plane edges. Returns new V and stats."""
+    """Project vertices onto detected surfaces; sharpen plane-plane edges. Returns new V and stats.
+
+    Vectorised: the common case (vertex inside one region) is done per region with numpy; only
+    vertices on region boundaries (a small fraction) are handled one by one.
+    """
+    from scipy.spatial import cKDTree
     V = V.copy()
     nV = len(V)
-    # vertex -> set of region ids (via incident faces)
-    vf_v = F.ravel()
-    vf_l = np.repeat(labels, 3)
-    pairs = np.unique(np.c_[vf_v, vf_l], axis=0)
-    by_v = {}
-    for v, l in pairs:
-        by_v.setdefault(int(v), []).append(int(l))
-    moved = np.zeros(nV)
-    n_line = n_corner = 0
     planes = {i: r for i, r in enumerate(regions) if r is not None and r["type"] == "plane"}
     cyls = {i: r for i, r in enumerate(regions) if r is not None and r["type"] == "cylinder"}
-    unassigned = []
-    for v, ls in by_v.items():
-        ls_valid = [l for l in ls if l >= 0]
-        if -1 in ls or not ls_valid:
-            unassigned.append(v)
-            if not ls_valid:
-                continue
-        p = V[v]
-        pl = [l for l in ls_valid if l in planes]
-        cy = [l for l in ls_valid if l in cyls]
-        newp = None
-        if len(pl) == 1 and not cy:
-            r = planes[pl[0]]
-            newp = p - (p @ r["normal"] + r["d"]) * r["normal"]
-        elif len(pl) >= 2:
-            newp = _project_planes(p, [planes[l] for l in pl])
-            if newp is not None:
+    vf_v = F.ravel()
+    vf_l = np.repeat(labels, 3)
+    lmin = np.full(nV, np.iinfo(np.int64).max)
+    lmax = np.full(nV, -2)
+    np.minimum.at(lmin, vf_v, vf_l)
+    np.maximum.at(lmax, vf_v, vf_l)
+    used = lmax > -2
+    moved = np.zeros(nV)
+    single = used & (lmin == lmax) & (lmin >= 0)
+    for rid in np.unique(lmin[single]):
+        r = regions[rid]
+        idx = np.where(single & (lmin == rid))[0]
+        p = V[idx]
+        if r["type"] == "plane":
+            q = p - (p @ r["normal"] + r["d"])[:, None] * r["normal"]
+        else:
+            a = r["axis"]
+            v = p - r["point"]
+            ax = (v @ a)[:, None] * a
+            rad = v - ax
+            nr = np.linalg.norm(rad, axis=1, keepdims=True)
+            q = r["point"] + ax + rad / np.maximum(nr, 1e-9) * r["radius"]
+        mv = np.linalg.norm(q - p, axis=1)
+        ok = mv <= max_move
+        V[idx[ok]] = q[ok]
+        moved[idx[ok]] = mv[ok]
+    multi = np.where(used & (lmin != lmax))[0]
+    n_line = n_corner = 0
+    if len(multi):
+        sel = np.isin(vf_v, multi)
+        pairs = np.unique(np.c_[vf_v[sel], vf_l[sel]], axis=0)
+        by_v = {}
+        for v, l in pairs:
+            if l >= 0:
+                by_v.setdefault(int(v), []).append(int(l))
+        for v, ls in by_v.items():
+            p = V[v]
+            pl = [l for l in ls if l in planes]
+            cy = [l for l in ls if l in cyls]
+            newp = None
+            if len(pl) >= 2:
+                newp = _project_planes(p, [planes[l] for l in pl])
                 if len(pl) == 2:
                     n_line += 1
                 else:
                     n_corner += 1
-        elif len(cy) == 1 and not pl:
-            newp = _project_cyl(p, cyls[cy[0]])
-        if newp is not None and np.linalg.norm(newp - p) <= max_move:
-            moved[v] = np.linalg.norm(newp - p)
-            V[v] = newp
-    # edge sharpening: unassigned vertices close to 2+ planes from nearby regions
-    n_sharp = 0
-    if sharpen and planes:
-        nb = _vertex_ring_labels(F, labels, nV, rings=3)
-        for v in unassigned:
-            cand = [l for l in nb.get(v, ()) if l in planes]
-            if len(cand) < 2:
-                continue
-            p = V[v]
-            ds = [abs(p @ planes[l]["normal"] + planes[l]["d"]) for l in cand]
-            close = [l for l, d in zip(cand, ds) if d <= max_move]
-            if len(close) < 2:
-                continue
-            newp = _project_planes(p, [planes[l] for l in close])
+            elif len(pl) == 1 and not cy:
+                r = planes[pl[0]]
+                newp = p - (p @ r["normal"] + r["d"]) * r["normal"]
+            elif len(cy) == 1 and not pl:
+                newp = _project_cyl(p, cyls[cy[0]])
             if newp is not None and np.linalg.norm(newp - p) <= max_move:
                 moved[v] = np.linalg.norm(newp - p)
                 V[v] = newp
-                n_sharp += 1
+    n_sharp = 0
+    if sharpen and planes:
+        un = np.zeros(nV, bool)
+        un[vf_v[vf_l < 0]] = True
+        cand_v = np.where(un)[0]
+        lab_f = np.where(np.isin(labels, list(planes)))[0]
+        if len(cand_v) and len(lab_f):
+            tri_c = V[F[lab_f]].mean(1)
+            tree = cKDTree(tri_c)
+            for v, nb in zip(cand_v, tree.query_ball_point(V[cand_v], max_move * 2.5)):
+                if len(nb) < 2:
+                    continue
+                cl = np.unique(labels[lab_f[nb]])
+                if len(cl) < 2:
+                    continue
+                p = V[v]
+                close = [int(l) for l in cl if abs(p @ planes[l]["normal"] + planes[l]["d"]) <= max_move]
+                if len(close) < 2:
+                    continue
+                newp = _project_planes(p, [planes[l] for l in close])
+                if newp is not None and np.linalg.norm(newp - p) <= max_move:
+                    moved[v] = np.linalg.norm(newp - p)
+                    V[v] = newp
+                    n_sharp += 1
     stats = {"snapped": int((moved > 0).sum()), "edge_vertices": n_line, "corner_vertices": n_corner,
              "sharpened": n_sharp, "mean_move_mm": float(moved[moved > 0].mean()) if (moved > 0).any() else 0.0}
     return V, stats
-
-
-def _vertex_ring_labels(F, labels, nV, rings=3):
-    """For each vertex, set of region labels of faces within `rings` face-rings."""
-    from scipy.sparse import csr_matrix
-    nF = len(F)
-    VF = csr_matrix((np.ones(3 * nF), (F.ravel(), np.repeat(np.arange(nF), 3))), shape=(nV, nF))
-    FV = VF.T.tocsr()
-    reach = VF.copy()
-    for _ in range(rings - 1):
-        reach = (reach @ FV @ VF)
-        reach.data[:] = 1
-    reach = reach.tocoo()
-    lab = labels[reach.col]
-    ok = lab >= 0
-    out = {}
-    for v, l in zip(reach.row[ok], lab[ok]):
-        out.setdefault(int(v), set()).add(int(l))
-    return out
 
 
 def _project_planes(p, planes):

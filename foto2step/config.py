@@ -49,6 +49,8 @@ DEFAULTS = {
         "floor_clearance_mm": 3.0,
         "target_max_error_mm": 0.15,  # decimatie mag max zoveel afwijken
         "max_triangles": 400000,
+        "fill_holes_mm": 3000.0,
+        "working_triangles": 1200000,  # max. driehoeken per mesh tijdens verwerking (geheugen)  # gaten tot deze straal dichten (nodig voor solids)
     },
     "features": {
         "enable": True,
