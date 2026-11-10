@@ -43,6 +43,7 @@ DEFAULTS = {
     "mesh": {
         "voxel_mm": 1.0,          # puntenwolk-uitdunning
         "poisson_depth": 0,       # 0 = automatisch uit voxel_mm
+        "poisson_max_depth": 11,  # 11 ~ 4 GB RAM, 12 ~ 12-16 GB RAM (fijner detail op grote machines)
         "density_trim_quantile": 0.0,  # 0 = alleen afstand-gebaseerd trimmen
         "crop_margin_mm": 300.0,  # marge rond markers/object
         "remove_floor": True,     # vloer-markers definieren vloervlak; vloer wordt verwijderd

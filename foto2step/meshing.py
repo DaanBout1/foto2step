@@ -48,11 +48,13 @@ def noise_estimate(pc, k=16, sample=20000):
     return float(np.median(np.sqrt(np.maximum(ev[:, 0], 0))))
 
 
-def poisson_mesh(pc, voxel, depth=0, trim_dist=None, density_q=0.0):
+def poisson_mesh(pc, voxel, depth=0, trim_dist=None, density_q=0.0, max_depth=11):
+    """Screened Poisson. depth 0 = automatic from voxel size, capped at max_depth (memory: depth 11 ~4 GB,
+    depth 12 ~12-16 GB)."""
     pts = np.asarray(pc.points)
     ext = float(np.max(pts.max(0) - pts.min(0)))
     if not depth:
-        depth = int(np.clip(np.ceil(np.log2(ext / voxel * 1.1)), 6, 12))
+        depth = int(np.clip(np.ceil(np.log2(ext / voxel * 1.1)), 6, max_depth))
     log(f"  Poisson-meshing depth {depth} ({len(pts):,} punten, {ext:.0f} mm)")
     mesh, dens = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pc, depth=depth, scale=1.1, linear_fit=True)
     dens = np.asarray(dens)

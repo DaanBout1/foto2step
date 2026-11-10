@@ -97,7 +97,8 @@ class Pipeline:
             noise = meshing.noise_estimate(pc)
             log(f"  oppervlakteruis ~{noise:.3f} mm (RMS)")
             o3d.io.write_point_cloud(str(d / "cloud_clean.ply"), pc)
-            mesh = meshing.poisson_mesh(pc, cm["voxel_mm"], cm["poisson_depth"], density_q=cm["density_trim_quantile"])
+            # this mesh is only used to decide which surface belongs to which part: 2-3 mm resolution is plenty
+            mesh = meshing.poisson_mesh(pc, max(cm["voxel_mm"], 1.5), 0, density_q=cm["density_trim_quantile"], max_depth=10)
             mesh = meshing.cap_triangles(mesh, int(cm.get("working_triangles", 1200000)) // 2)
             o3d.io.write_triangle_mesh(str(d / "mesh_full.ply"), mesh)
             (d / "noise.json").write_text(json.dumps({"noise_mm": noise}))
@@ -267,7 +268,8 @@ class Pipeline:
             else:
                 pc.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=4 * cm["voxel_mm"], max_nn=40))
                 self._orient_normals(pc, h, info)
-            mesh = meshing.poisson_mesh(pc, cm["voxel_mm"], cm["poisson_depth"], density_q=cm["density_trim_quantile"])
+            mesh = meshing.poisson_mesh(pc, cm["voxel_mm"], cm["poisson_depth"], density_q=cm["density_trim_quantile"],
+                                        max_depth=int(cm.get("poisson_max_depth", 11)))
             mesh = meshing.cap_triangles(mesh, int(cm.get("working_triangles", 1200000)))
             if b.get("static") and cm.get("remove_floor", True):
                 mesh = _clamp_floor(mesh, float(cm.get("floor_snap_mm", 40.0)))
