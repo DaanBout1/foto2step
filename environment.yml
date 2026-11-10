@@ -18,4 +18,5 @@ dependencies:
       - open3d
       - trimesh
       - cadquery-ocp
+      - mapbox_earcut
       - -e .

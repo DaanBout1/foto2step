@@ -131,3 +131,19 @@ def test_motion_grouping():
         else:
             assert abs(abs(x["angles_deg"]["B"]) - 30) < 0.1
             assert np.linalg.norm(np.array(x["point"][:2]) - [-450, 0]) < 1.0
+
+
+def test_fill_holes_open_box():
+    import open3d as o3d
+    from foto2step.meshing import fill_holes
+    m = trimesh.creation.box(extents=[100, 60, 40]).subdivide().subdivide()
+    keep = m.triangles_center[:, 2] > -19.9  # remove bottom
+    F = m.faces[keep]
+    om = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(m.vertices), o3d.utility.Vector3iVector(F))
+    om.remove_unreferenced_vertices()
+    assert not om.is_watertight()
+    out, n, left = fill_holes(om, 1000)
+    assert n == 1 and left == 0
+    assert out.is_watertight()
+    assert abs(out.get_volume() - 100 * 60 * 40) < 1e-3
+    assert np.abs(np.asarray(out.vertices)).max() <= 50 + 1e-9

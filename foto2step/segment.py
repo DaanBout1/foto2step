@@ -100,7 +100,7 @@ def evidence(q, nq, scene, cams, tau, max_cams=60):
         ok = z > 50.0
         uv = np.full((n, 2), -1e9)
         if ok.any():
-            uv[ok] = cam.img_from_cam(pc[ok], check_cheirality=False) if True else 0
+            uv[ok] = cam.img_from_cam(pc[ok], check_cheirality=False)
         ok &= (uv[:, 0] > 5) & (uv[:, 1] > 5) & (uv[:, 0] < cam.width - 5) & (uv[:, 1] < cam.height - 5)
         idx = np.where(ok)[0]
         if not len(idx):

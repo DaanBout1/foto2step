@@ -202,13 +202,13 @@ class Pipeline:
             mesh = meshing.poisson_mesh(pc, cm["voxel_mm"], cm["poisson_depth"], density_q=cm["density_trim_quantile"])
             mesh = meshing.cap_triangles(mesh, int(cm.get("working_triangles", 1200000)))
             if b.get("static") and cm.get("remove_floor", True):
-                mesh = _clamp_floor(mesh, cm["floor_clearance_mm"] + 4 * cm["voxel_mm"])
+                mesh = _clamp_floor(mesh, float(cm.get("floor_snap_mm", 40.0)))
             mesh = _fill(mesh, hole_mm=float(cm.get("fill_holes_mm", 3000.0)))
             feat = {}
             if self.cfg["features"].get("enable", True):
                 mesh, feat = regularize_mesh(mesh, noise, self.cfg["features"])
             ref_pts = np.asarray(pc.points)
-            dec = meshing.decimate_bounded(mesh, max(cm["target_max_error_mm"], 0.05), cm["max_triangles"])
+            dec = meshing.decimate_bounded(mesh, max(cm["target_max_error_mm"], noise, 0.05), cm["max_triangles"])
             dec = _fill(dec, hole_mm=float(cm.get("fill_holes_mm", 3000.0)))
             # accuracy: measured points -> final surface
             acc = _surface_dev(dec, ref_pts)
@@ -279,33 +279,29 @@ def _np(o):
     raise TypeError(type(o))
 
 
-def _clamp_floor(mesh, z_thr):
-    """Boundary vertices just above the floor -> put exactly on the floor (z=0), so the base closes flat."""
+def _clamp_floor(mesh, z_band):
+    """Extend the machine down to the floor: boundary loops that run along the floor (most vertices
+    below z_band) get their low vertices moved straight down to z=0, so the base can be closed flat."""
     V = np.asarray(mesh.vertices).copy()
     F = np.asarray(mesh.triangles)
-    e = np.sort(np.vstack([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]]), axis=1)
-    u, c = np.unique(e, axis=0, return_counts=True)
-    bverts = np.unique(u[c == 1])
-    sel = bverts[V[bverts, 2] < z_thr]
-    V[sel, 2] = 0.0
+    n = 0
+    for lp in meshing.boundary_loops(F):
+        z = V[lp, 2]
+        if np.mean(z < z_band) >= 0.8:
+            sel = np.array(lp)[z < z_band]
+            V[sel, 2] = 0.0
+            n += len(sel)
+    if n:
+        log(f"  {n} randpunten naar de vloer (z=0) doorgetrokken")
     mesh.vertices = o3d.utility.Vector3dVector(V)
     return mesh
 
 
-def _fill(mesh, hole_mm=400.0):
-    try:
-        t = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
-        t = t.fill_holes(hole_size=hole_mm)
-        m = t.to_legacy()
-        m.remove_degenerate_triangles()
-        m.remove_duplicated_triangles()
-        m.remove_duplicated_vertices()
-        m.remove_unreferenced_vertices()
-        m.compute_vertex_normals()
-        return m
-    except Exception as e:
-        log(f"  gaten vullen mislukt: {e}")
-        return mesh
+def _fill(mesh, hole_mm=3000.0):
+    mesh, n, left = meshing.fill_holes(mesh, hole_mm)
+    if n or left:
+        log(f"  gaten gedicht: {n}" + (f", {left} te groot/onregelmatig (blijft open)" if left else ""))
+    return mesh
 
 
 def _surface_dev(mesh, pts):

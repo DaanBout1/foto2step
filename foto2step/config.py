@@ -43,10 +43,11 @@ DEFAULTS = {
     "mesh": {
         "voxel_mm": 1.0,          # puntenwolk-uitdunning
         "poisson_depth": 0,       # 0 = automatisch uit voxel_mm
-        "density_trim_quantile": 0.02,
+        "density_trim_quantile": 0.0,  # 0 = alleen afstand-gebaseerd trimmen
         "crop_margin_mm": 300.0,  # marge rond markers/object
         "remove_floor": True,     # vloer-markers definieren vloervlak; vloer wordt verwijderd
         "floor_clearance_mm": 3.0,
+        "floor_snap_mm": 40.0,    # open onderrand lager dan dit -> doorgetrokken tot de vloer
         "target_max_error_mm": 0.15,  # decimatie mag max zoveel afwijken
         "max_triangles": 400000,
         "fill_holes_mm": 3000.0,

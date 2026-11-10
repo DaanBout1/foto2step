@@ -337,6 +337,7 @@ def make_dataset(out: Path, w=1600, h=1200, f=1250.0, k1=-0.06, k2=0.03, states=
                     "world": {"origin_id": 8, "x_axis_id": 9}},
         "states": [{"name": s, "images": f"photos_{s}"} for s in states],
         "dense": {"backend": "openmvs", "resolution_level": 0},
+        "sfm": {"max_features": 8192},
     }
     (out / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
     return out
