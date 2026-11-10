@@ -71,17 +71,49 @@ def collect_images(src: Path, out_dir: Path, cfg_frames: dict) -> dict:
     return info
 
 
+def _read_photo(p: Path):
+    """Read in *sensor* orientation (EXIF rotation ignored) so all photos share one intrinsic calibration.
+    HEIC (iPhone) is supported via pillow-heif when installed."""
+    img = cv2.imread(str(p), cv2.IMREAD_COLOR | cv2.IMREAD_IGNORE_ORIENTATION)
+    if img is None and p.suffix.lower() in (".heic", ".heif"):
+        try:
+            import pillow_heif
+            from PIL import Image
+            pillow_heif.register_heif_opener()
+            with Image.open(p) as im:
+                img = cv2.cvtColor(np.asarray(im.convert("RGB")), cv2.COLOR_RGB2BGR)
+        except Exception:
+            img = None
+    return img
+
+
 def _from_photos(files, out_dir, info, max_side):
-    sharp = []
-    sizes = set()
-    focal = []
-    for k, p in enumerate(files):
-        img = cv2.imread(str(p), cv2.IMREAD_COLOR)  # past EXIF-rotatie toe
+    imgs = []
+    for p in files:
+        img = _read_photo(p)
         if img is None:
-            log(f"  WAARSCHUWING: kan {p.name} niet lezen (HEIC? zet de telefoon op JPG)")
+            log(f"  WAARSCHUWING: kan {p.name} niet lezen (overgeslagen)")
             continue
+        imgs.append((p, img.shape[:2]))
+    if not imgs:
+        return
+    # majority shape; transposed images (rotated by the phone app) are rotated back
+    shapes = [s for _, s in imgs]
+    main = max(set(shapes), key=shapes.count)
+    sharp = []
+    focal = []
+    n_rot = n_skip = 0
+    for k, (p, shp) in enumerate(imgs):
+        img = _read_photo(p)
+        if shp != main:
+            if shp == main[::-1]:
+                img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+                n_rot += 1
+            else:
+                log(f"  WAARSCHUWING: {p.name} heeft afwijkend formaat {shp} (andere lens/zoom?) -> overgeslagen")
+                n_skip += 1
+                continue
         img = _resize(img, max_side)
-        sizes.add(img.shape[:2])
         fp = _exif_focal_px(p, img.shape[1], img.shape[0])
         if fp:
             focal.append(fp)
@@ -90,8 +122,10 @@ def _from_photos(files, out_dir, info, max_side):
         name = f"img_{k:04d}.jpg"
         sharp.append((name, s, p.name))
         cv2.imwrite(str(out_dir / name), img, [cv2.IMWRITE_JPEG_QUALITY, 98])
-    if len(sizes) > 1:
-        log(f"  WAARSCHUWING: verschillende beeldformaten {sizes}. Gebruik 1 lens, vaste zoom, zelfde oriëntatie!")
+    if n_rot:
+        log(f"  {n_rot} staande foto's teruggedraaid naar sensororiëntatie")
+    if n_skip:
+        log(f"  {n_skip} foto's met ander formaat overgeslagen: gebruik 1 lens en vaste zoom!")
     med = np.median([s for _, s, _ in sharp]) if sharp else 0
     for name, s, orig in sharp:
         if s < 0.3 * med:
@@ -139,6 +173,8 @@ def _from_video(path, out_dir, cfg, info, max_side, prefix=""):
         ok, img = cap.read()
         if not ok:
             break
+        if img.shape[0] > img.shape[1]:
+            img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)  # sensor is landscape
         img = _resize(img, max_side)
         g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         win.append((img, sharpness(g), idx))

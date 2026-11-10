@@ -56,6 +56,10 @@ python -m foto2step markers --ids 200-231 --size 40 -o delen.pdf     # bewegende
 * Plak markers op iets stijfs en vlaks (dibond/alu/3 mm MDF): papier bolt op.
 * **Vloer**: 8–16 markers rondom de machine, plat op de vloer. Kies er één als oorsprong (`origin_id`), één als X-richting (`x_axis_id`).
 * **Schaallat**: 2 markers op een stijf alu-profiel van ~1 m. Meet hart-hart met een schuifmaat/rolmaat (`scale_bars`). Liefst 2 latten in verschillende richtingen. Dit is de belangrijkste factor voor nauwkeurigheid op grote maten.
+  Met schaallatten bepalen die de schaal; de markergroottes dienen dan alleen als controle. Het programma meldt
+  het als je printer de markers net te groot/klein heeft geprint.
+* **Zonder markers** (bv. een willekeurige video van internet) kan het programma geen millimeters bepalen:
+  dan bestaat er geen schaal. Markers zijn dus verplicht.
 * **Controlemaat** (aanrader): meet 1–2 afstanden tussen andere vloermarkers en zet die onder `check_distances`. Die worden niet gebruikt voor de schaal, alleen om de fout eerlijk te meten.
 * **Vast frame**: een paar markers op het machineframe.
 * **Elk bewegend deel**: minstens **2 markers** (liefst 3, ver uit elkaar, op verschillende vlakken). Zo herkent het programma welk deel beweegt en hoe.
@@ -65,7 +69,9 @@ python -m foto2step markers --ids 200-231 --size 40 -o delen.pdf     # bewegende
 **Telefooninstellingen**
 * Hoofdcamera, **1× zoom, nooit wisselen** van lens (iPhone: "Macrobediening" uit; Android: Pro-modus).
 * **Focus en belichting vastzetten** (lang tikken → AE/AF-vergrendeling). Geen HDR/portret/nachtmodus.
-* Hoogste resolutie, **JPG** (iPhone: Instellingen → Camera → Formaten → "Meest compatibel"), geen flits.
+* Hoogste resolutie, geen flits. JPG en HEIC (iPhone) werken allebei. Staand en liggend mag door elkaar:
+  het programma draait alles terug naar de sensororiëntatie, zodat één lenskalibratie voor alle foto's geldt.
+* Foto's met een ander beeldformaat (andere lens/zoom) worden overgeslagen en gemeld.
 
 **Machine-oppervlak**
 * Egale lak, glimmend metaal, zwart of transparant = slecht. Gebruik **scanspray** (bv. AESUB, verdampt vanzelf) of plak

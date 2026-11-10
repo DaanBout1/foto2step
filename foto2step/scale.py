@@ -132,25 +132,34 @@ def estimate_scale(markers: dict, cfg_m: dict) -> dict:
         else:
             log(f"  WAARSCHUWING: schaallat {a}-{b}: marker(s) niet gevonden")
     out["bars"] = bars
-    # combine (inverse variance)
-    vals = [k_markers]
-    ws = [1.0 / max(out["markers"]["rel_se"], 1e-6) ** 2]
-    for b in bars:
-        vals.append(b["mm_per_unit"])
-        ws.append(1.0 / max(b["rel_sigma"], 1e-6) ** 2)
-    vals = np.array(vals)
-    ws = np.array(ws)
-    k = float((vals * ws).sum() / ws.sum())
-    rel = float(1 / np.sqrt(ws.sum()))
-    # consistency check: inflate uncertainty if sources disagree (Birge ratio)
-    if len(vals) > 1:
-        chi2 = float((ws * ((vals - k) / k) ** 2).sum() / (len(vals) - 1))
-        if chi2 > 1:
-            rel *= np.sqrt(chi2)
-        out["consistency_chi2"] = chi2
-        out["markers_vs_bars_rel_diff"] = float((k_markers - k) / k)
+    # Scale bars are measured independently and are long -> they define the scale when present.
+    # Marker sizes then only serve as a check (printers often scale by 0.5-2%).
+    if bars:
+        ws = np.array([1.0 / max(b["rel_sigma"], 1e-6) ** 2 for b in bars])
+        vals = np.array([b["mm_per_unit"] for b in bars])
+        k = float((vals * ws).sum() / ws.sum())
+        rel = float(1 / np.sqrt(ws.sum()))
+        if len(vals) > 1:
+            chi2 = float((ws * ((vals - k) / k) ** 2).sum() / (len(vals) - 1))
+            if chi2 > 1:
+                rel *= np.sqrt(chi2)
+            out["consistency_chi2"] = chi2
+        out["source"] = "schaallatten"
+        out["marker_size_factor"] = float(k_markers / k)  # >1: markers kleiner geprint dan opgegeven
+        if abs(out["marker_size_factor"] - 1) > 3 * max(out["markers"]["rel_se"], 1e-4) and abs(out["marker_size_factor"] - 1) > 0.002:
+            log(f"  LET OP: markers zijn {abs(1 - 1 / out['marker_size_factor']) * 100:.2f}% "
+                f"{'groter' if out['marker_size_factor'] < 1 else 'kleiner'} dan opgegeven in de config "
+                "(printerschaal?). Schaal komt van de schaallatten, dus geen probleem, maar controleer size_mm.")
+    else:
+        k = k_markers
+        rel = out["markers"]["rel_se"]
+        # systematic print/measure uncertainty of marker size (caliper ~0.05 mm)
+        sizes = [v["size"] for v in per_marker.values()]
+        rel = float(np.sqrt(rel ** 2 + (0.05 / np.median(sizes)) ** 2))
+        out["source"] = "markergrootte"
     out["mm_per_unit"] = k
     out["rel_sigma"] = rel
+    out["markers_vs_bars_rel_diff"] = out.get("marker_size_factor", 1.0) - 1.0
     out["per_marker"] = {int(mid): {"mm_per_unit": float(v["mm_per_unit"]), "shape_rms_mm": float(v["shape_rms_model"] * k)}
                          for mid, v in per_marker.items()}
     return out
