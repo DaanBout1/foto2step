@@ -57,7 +57,7 @@ def mesh_to_shape(V: np.ndarray, F: np.ndarray, merge_coplanar=True, lin_tol=0.0
             n_tri = np.cross(V[b] - V[a], V[c] - V[a])
             n_face = _face_normal(face)
             if n_face is not None and np.dot(n_face, n_tri) < 0:
-                face = TopoDS.TopoDS.Face_s(face.Reversed())
+                face = _as_face(face.Reversed())
             builder.Add(shell, face)
         except Exception:
             n_fail += 1
@@ -97,6 +97,14 @@ def mesh_to_shape(V: np.ndarray, F: np.ndarray, merge_coplanar=True, lin_tol=0.0
     info = {"kind": kind, "triangles": int(n_faces_before), "brep_faces": int(nf), "failed_triangles": n_fail,
             "valid": bool(valid), "closed_mesh": bool(closed)}
     return shape, info
+
+
+def _as_face(shape):
+    from OCP import TopoDS as _T
+    for fn in (getattr(getattr(_T, "TopoDS", None), "Face", None), getattr(getattr(_T, "TopoDS", None), "Face_s", None)):
+        if fn is not None:
+            return fn(shape)
+    raise RuntimeError("TopoDS.Face cast niet gevonden")
 
 
 def _face_normal(face):
@@ -183,10 +191,29 @@ def write_step(parts: list, path: Path, assembly_name="machine"):
     w.SetColorMode(True)
     if not w.Transfer(doc, STEPControl_AsIs):
         raise RuntimeError("STEP transfer mislukt")
-    status = w.Write(str(path))
+    with _quiet():
+        status = w.Write(str(path))
     if status != IFSelect_RetDone:
         raise RuntimeError(f"STEP schrijven mislukt: {path}")
     return path
+
+
+class _quiet:
+    """Silence OCC's console banner (writes to fd 1)."""
+
+    def __enter__(self):
+        import os
+        import sys
+        sys.stdout.flush()
+        self.fd = os.dup(1)
+        self.dn = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(self.dn, 1)
+
+    def __exit__(self, *a):
+        import os
+        os.dup2(self.fd, 1)
+        os.close(self.fd)
+        os.close(self.dn)
 
 
 def read_step_check(path: Path) -> dict:
@@ -199,7 +226,9 @@ def read_step_check(path: Path) -> dict:
     from OCP.BRepBndLib import BRepBndLib
     from OCP.TopAbs import TopAbs_SOLID, TopAbs_FACE, TopAbs_SHELL
     r = STEPControl_Reader()
-    if r.ReadFile(str(path)) != IFSelect_RetDone:
+    with _quiet():
+        ok = r.ReadFile(str(path))
+    if ok != IFSelect_RetDone:
         raise RuntimeError(f"STEP niet leesbaar: {path}")
     r.TransferRoots()
     shp = r.OneShape()
