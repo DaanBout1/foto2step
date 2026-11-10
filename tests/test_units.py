@@ -147,3 +147,25 @@ def test_fill_holes_open_box():
     assert out.is_watertight()
     assert abs(out.get_volume() - 100 * 60 * 40) < 1e-3
     assert np.abs(np.asarray(out.vertices)).max() <= 50 + 1e-9
+
+
+def test_marker_edge_refinement_unbiased():
+    """Edge-based corners must not shrink the marker (corner detectors on L-corners pull inward)."""
+    import cv2
+    from foto2step.markers import detect, make_detector, marker_image, refine_edges
+    rng = np.random.default_rng(0)
+    S, N = 8, 700
+    shrink = []
+    for _ in range(6):
+        mk = (marker_image("DICT_5X5_250", 7, 300 * S).astype(np.float32) / 255 * 200 + 20).astype(np.uint8)
+        src = np.float32([[-0.5, -0.5], [300 * S - 0.5, -0.5], [300 * S - 0.5, 300 * S - 0.5], [-0.5, 300 * S - 0.5]])
+        c0 = np.float32([[200, 180], [500, 210], [480, 510], [190, 470]]) + rng.normal(0, 15, (4, 2)).astype(np.float32)
+        H = cv2.getPerspectiveTransform(src, (c0 + 0.5) * S - 0.5)
+        big = cv2.warpPerspective(mk, H, (N * S, N * S), borderValue=235, flags=cv2.INTER_LINEAR)
+        img = cv2.resize(big, (N, N), interpolation=cv2.INTER_AREA).astype(np.float32)
+        img = np.clip(cv2.GaussianBlur(img, (0, 0), 0.8) + rng.normal(0, 2, img.shape), 0, 255).astype(np.uint8)
+        d = detect(img, make_detector("DICT_5X5_250"))
+        e = refine_edges(img, d[7])
+        cen = c0.mean(0)
+        shrink += list(np.linalg.norm(c0 - cen, axis=1) - np.linalg.norm(e - cen, axis=1))
+    assert abs(np.mean(shrink)) < 0.05  # pixels
