@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "foto2step"
+version = "0.1.0"
+description = "Telefoonfoto's/video -> geschaalde 3D-reconstructie -> STEP per (bewegend) onderdeel voor digital twins"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy", "scipy", "pyyaml", "pillow", "reportlab",
+  "opencv-contrib-python", "open3d", "trimesh", "pycolmap", "cadquery-ocp",
+]
+
+[project.scripts]
+foto2step = "foto2step.cli:main"
+
+[tool.setuptools]
+packages = ["foto2step"]

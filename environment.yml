@@ -1,0 +1,21 @@
+# Installatie (Windows/Linux/macOS):  conda env create -f environment.yml   (gebruik Miniforge)
+name: foto2step
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - colmap          # SfM + (met NVIDIA GPU) dense reconstructie
+  - openmvs         # dense reconstructie op CPU/GPU
+  - numpy
+  - scipy
+  - pyyaml
+  - pillow
+  - reportlab
+  - pip
+  - pip:
+      - pycolmap
+      - opencv-contrib-python
+      - open3d
+      - trimesh
+      - cadquery-ocp
+      - -e .
