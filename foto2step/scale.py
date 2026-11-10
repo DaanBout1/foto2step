@@ -9,17 +9,37 @@ import numpy as np
 
 from .geometry import fit_plane, make_T, sim_T, to_h, triangulate_dlt, triangulate_refine, umeyama
 from .log import log
-from .markers import detect, make_detector, marker_object_corners
+from .markers import detect, make_detector, marker_object_corners, refine_edges
 
 
-def detect_all(image_dir: Path, names, dict_name: str) -> dict:
+def detect_all(image_dir: Path, names, dict_name: str, cams: dict | None = None) -> dict:
+    """Detect markers. With cams given, returns undistorted *normalised* corners refined from the marker
+    edges (unbiased, lens distortion removed); otherwise pixel corners."""
     det = make_detector(dict_name)
     out = {}
+    n_ref = n_tot = 0
     for n in names:
-        img = cv2.imread(str(image_dir / n), cv2.IMREAD_GRAYSCALE)
+        img = cv2.imread(str(image_dir / n), cv2.IMREAD_GRAYSCALE | cv2.IMREAD_IGNORE_ORIENTATION)
         if img is None:
             continue
-        out[n] = detect(img, det)
+        d = detect(img, det)
+        if cams is not None and n in cams:
+            cam = cams[n][0]
+            to_norm = lambda p, cam=cam: cam.cam_from_img(np.asarray(p, float) + 0.5)  # OpenCV -> COLMAP pixels
+            dn = {}
+            for mid, c in d.items():
+                n_tot += 1
+                r = refine_edges(img, c, to_norm)
+                if r is None:
+                    r = np.asarray(to_norm(c))  # fall back to detector corners
+                else:
+                    n_ref += 1
+                dn[mid] = r
+            out[n] = dn
+        else:
+            out[n] = d
+    if cams is not None and n_tot:
+        log(f"  marker-randen verfijnd: {n_ref}/{n_tot} detecties")
     return out
 
 
@@ -35,7 +55,7 @@ def triangulate_markers(recon, cams: dict, detections: dict, min_views: int = 3,
         cam, M, _ = cams[name]
         f = float(np.mean([cam.focal_length_x, cam.focal_length_y]))
         for mid, c in dets.items():
-            xn = np.asarray(cam.cam_from_img(c + 0.5))  # OpenCV -> COLMAP pixel convention
+            xn = np.asarray(c, float)  # already undistorted normalised coordinates
             if xn.shape != (4, 2) or not np.all(np.isfinite(xn)):
                 continue
             for k in range(4):
@@ -236,7 +256,7 @@ def calibrate_state(state_dir: Path, image_dir: Path, sparse_dir: Path, cfg: dic
     cfg_m = cfg["markers"]
     recon, cams = load_cameras(sparse_dir)
     log(f"  markers detecteren in {len(cams)} beelden")
-    dets = detect_all(image_dir, list(cams), cfg_m["dictionary"])
+    dets = detect_all(image_dir, list(cams), cfg_m["dictionary"], cams)
     n_det = sum(len(d) for d in dets.values())
     mk = triangulate_markers(recon, cams, dets, int(cfg_m.get("min_views", 3)))
     log(f"  {n_det} marker-detecties, {len(mk)} markers volledig getrianguleerd")

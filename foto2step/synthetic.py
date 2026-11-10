@@ -327,13 +327,14 @@ def make_dataset(out: Path, w=1600, h=1200, f=1250.0, k1=-0.06, k2=0.03, states=
             mesh.export(out / f"gt_{st}_{name}.ply")
     (out / "gt.json").write_text(json.dumps(gt, indent=1))
     sizes = {m["id"]: m["size"] for m in scene["markers"] if m["size"] != 100}
+    floor_xy = {m["id"]: m["center"][:2] for m in scene["markers"] if m["body"] == "floor"}
     import yaml
     cfg = {
         "project": "synthetic_machine",
         "markers": {"dictionary": DICT, "size_mm": 100.0, "sizes_mm": sizes,
                     "scale_bars": [{"a": 0, "b": 1, "distance_mm": 1000.0}, {"a": 8, "b": 10, "distance_mm": 2500.0}],
                     "check_distances": [{"a": 2, "b": 6, "distance_mm": float(np.linalg.norm(
-                        np.subtract([1000, -500], [-500, 1000])))}, {"a": 9, "b": 11, "distance_mm": 2500.0}],
+                        np.subtract(floor_xy[2], floor_xy[6])))}, {"a": 9, "b": 11, "distance_mm": 2500.0}],
                     "world": {"origin_id": 8, "x_axis_id": 9}},
         "states": [{"name": s, "images": f"photos_{s}"} for s in states],
         "dense": {"backend": "openmvs", "resolution_level": 0},

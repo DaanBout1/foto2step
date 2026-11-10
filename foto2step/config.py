@@ -32,6 +32,7 @@ DEFAULTS = {
         "matcher": "exhaustive",  # exhaustive | sequential (lange video's)
         "max_features": 16384,
         "use_gpu": True,
+        "guided_matching": "auto", # auto = alleen met GPU (op CPU ~10x trager)
     },
     "dense": {
         "backend": "auto",        # auto | colmap | openmvs | none

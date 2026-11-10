@@ -78,7 +78,8 @@ def _run_pycolmap(image_dir, db, sparse, cfg_sfm, matcher, focal_prior):
     log(f"  SfM: matching ({matcher})")
     mo = pycolmap.FeatureMatchingOptions()
     mo.use_gpu = gpu
-    mo.guided_matching = True
+    g = cfg_sfm.get("guided_matching", "auto")
+    mo.guided_matching = gpu if g == "auto" else bool(g)  # ~10x trager op CPU, kleine winst
     if matcher == "sequential":
         po = pycolmap.SequentialPairingOptions()
         po.overlap = 30
@@ -120,11 +121,16 @@ def _run_cli(image_dir, db, sparse, cfg_sfm, matcher, focal_prior):
     mprefix = "FeatureMatching" if "FeatureMatching.use_gpu" in hm else "SiftMatching"
     if matcher == "sequential":
         _sh([b, "sequential_matcher", "--database_path", str(db), f"--{mprefix}.use_gpu", gpu,
-             "--SequentialMatching.overlap", "30", f"--{mprefix}.guided_matching", "1"])
+             "--SequentialMatching.overlap", "30", f"--{mprefix}.guided_matching", _guided(cfg_sfm, gpu)])
     else:
         _sh([b, "exhaustive_matcher", "--database_path", str(db), f"--{mprefix}.use_gpu", gpu,
-             f"--{mprefix}.guided_matching", "1"])
+             f"--{mprefix}.guided_matching", _guided(cfg_sfm, gpu)])
     _sh([b, "mapper", "--database_path", str(db), "--image_path", str(image_dir), "--output_path", str(sparse)])
+
+
+def _guided(cfg_sfm, gpu):
+    g = cfg_sfm.get("guided_matching", "auto")
+    return ("1" if gpu == "1" else "0") if g == "auto" else ("1" if g else "0")
 
 
 def _sh(cmd):

@@ -118,3 +118,81 @@ def write_marker_pdf(path: str | Path, dict_name: str, ids, size_mm: float, titl
         c.showPage()
     c.save()
     return path
+
+
+def refine_edges(gray: np.ndarray, corners_px: np.ndarray, to_norm=None, min_contrast=25.0):
+    """Unbiased marker corners from the four straight edges of the black square.
+
+    For each side, the edge is located at many points along it as the 50% intensity crossing between
+    the dark border (inside) and the white quiet zone (outside); for a symmetric blur this is unbiased,
+    unlike corner detectors on L-shaped corners (which pull inward). The edge points are converted with
+    `to_norm` (pixel -> undistorted normalised coords, e.g. COLMAP cam_from_img) so lens distortion is
+    removed before straight lines are fitted. Corners = intersections of adjacent lines.
+
+    Returns 4x2 corners in the coordinate system of to_norm (pixels if to_norm is None) or None.
+    """
+    from scipy.ndimage import map_coordinates
+    c = np.asarray(corners_px, float)
+    center = c.mean(0)
+    g = gray.astype(np.float32)
+    lines = []
+    for k in range(4):
+        a, b = c[k], c[(k + 1) % 4]
+        d = b - a
+        L = np.linalg.norm(d)
+        if L < 12:
+            return None
+        u = d / L
+        n = np.array([u[1], -u[0]])
+        if n @ ((a + b) / 2 - center) < 0:
+            n = -n  # outward
+        w = max(2.0, 0.8 * L / 7.0)  # stay within the one-bit black border inside
+        ns = int(np.clip(L / 2, 8, 80))
+        ts = np.linspace(0.18, 0.82, ns)
+        offs = np.linspace(-w, w, int(np.ceil(2 * w * 4)) + 1)
+        P = a[None, :] + ts[:, None] * d[None, :]
+        S = P[:, None, :] + offs[None, :, None] * n[None, None, :]
+        prof = map_coordinates(g, [S[..., 1].ravel(), S[..., 0].ravel()], order=1, mode="nearest").reshape(S.shape[:2])
+        m = max(2, len(offs) // 6)
+        dark = np.median(prof[:, :m], axis=1)
+        light = np.median(prof[:, -m:], axis=1)
+        good = (light - dark) > min_contrast
+        pts = []
+        for i in np.where(good)[0]:
+            thr = 0.5 * (dark[i] + light[i])
+            pr = prof[i]
+            idx = np.where((pr[:-1] < thr) & (pr[1:] >= thr))[0]
+            if len(idx) != 1:
+                continue
+            j = idx[0]
+            f = (thr - pr[j]) / max(pr[j + 1] - pr[j], 1e-6)
+            o = offs[j] + f * (offs[j + 1] - offs[j])
+            pts.append(P[i] + o * n)
+        if len(pts) < 5:
+            return None
+        pts = np.asarray(pts)
+        if to_norm is not None:
+            pts = np.asarray(to_norm(pts))
+            if pts.shape[0] < 5 or not np.all(np.isfinite(pts)):
+                return None
+        mu = pts.mean(0)
+        _, _, Vt = np.linalg.svd(pts - mu)
+        dirv = Vt[0]
+        res = (pts - mu) @ Vt[1]
+        # one robust reweighting pass
+        s = 1.4826 * np.median(np.abs(res)) + 1e-12
+        keep = np.abs(res) < 3 * s
+        if keep.sum() >= 5:
+            mu = pts[keep].mean(0)
+            _, _, Vt = np.linalg.svd(pts[keep] - mu)
+            dirv = Vt[0]
+        lines.append((mu, dirv))
+    out = []
+    for k in range(4):
+        (p1, d1), (p2, d2) = lines[(k - 1) % 4], lines[k]
+        A = np.c_[d1, -d2]
+        if abs(np.linalg.det(A)) < 1e-6:
+            return None
+        t = np.linalg.solve(A, p2 - p1)
+        out.append(p1 + t[0] * d1)
+    return np.array(out)
