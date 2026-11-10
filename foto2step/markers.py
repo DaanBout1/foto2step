@@ -1,0 +1,120 @@
+"""ArUco marker generation (printable PDF at exact scale) and sub-pixel detection."""
+from __future__ import annotations
+
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+
+def get_dictionary(name: str):
+    if not hasattr(cv2.aruco, name):
+        raise ValueError(f"Onbekende ArUco dictionary: {name}")
+    return cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, name))
+
+
+def marker_image(dict_name: str, marker_id: int, px: int = 600) -> np.ndarray:
+    d = get_dictionary(dict_name)
+    return cv2.aruco.generateImageMarker(d, int(marker_id), px, borderBits=1)
+
+
+def make_detector(dict_name: str):
+    d = get_dictionary(dict_name)
+    p = cv2.aruco.DetectorParameters()
+    p.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+    p.cornerRefinementWinSize = 7
+    p.cornerRefinementMaxIterations = 60
+    p.cornerRefinementMinAccuracy = 0.01
+    p.adaptiveThreshWinSizeMin = 3
+    p.adaptiveThreshWinSizeMax = 53
+    p.adaptiveThreshWinSizeStep = 10
+    p.minMarkerPerimeterRate = 0.01
+    p.errorCorrectionRate = 0.4  # strenger dan standaard -> minder valse ID's
+    return cv2.aruco.ArucoDetector(d, p)
+
+
+def detect(image_bgr_or_gray: np.ndarray, detector) -> dict[int, np.ndarray]:
+    """Return {id: 4x2 corners (pixel, OpenCV convention: pixel centre = integer)}.
+
+    Corners order: top-left, top-right, bottom-right, bottom-left of the marker as printed.
+    Markers seen twice in one image (ambiguous) are dropped.
+    """
+    img = image_bgr_or_gray
+    if img.ndim == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    corners, ids, _ = detector.detectMarkers(img)
+    out: dict[int, np.ndarray] = {}
+    if ids is None:
+        return out
+    seen = {}
+    for c, i in zip(corners, ids.ravel()):
+        seen.setdefault(int(i), []).append(c.reshape(4, 2).astype(np.float64))
+    for i, cs in seen.items():
+        if len(cs) == 1:
+            # extra sub-pixel refinement on the full-resolution image
+            c = cs[0].astype(np.float32).reshape(-1, 1, 2)
+            side = np.linalg.norm(cs[0][0] - cs[0][1])
+            win = int(np.clip(side / 12, 3, 11))
+            crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 80, 0.005)
+            try:
+                cv2.cornerSubPix(img, c, (win, win), (-1, -1), crit)
+            except cv2.error:
+                pass
+            out[i] = c.reshape(4, 2).astype(np.float64)
+    return out
+
+
+def marker_object_corners(size_mm: float) -> np.ndarray:
+    """Corners in marker frame (x right, y up on the printed sheet, z out of paper)."""
+    h = size_mm / 2.0
+    return np.array([[-h, h, 0], [h, h, 0], [h, -h, 0], [-h, -h, 0]], float)
+
+
+def write_marker_pdf(path: str | Path, dict_name: str, ids, size_mm: float, title: str = "") -> Path:
+    """Write an A4 PDF with markers at exact physical size (print at 100%, no fit-to-page)."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen import canvas
+    from PIL import Image
+
+    path = Path(path)
+    page_w, page_h = A4
+    margin = 12 * mm
+    quiet = max(size_mm * 0.25, 8.0)  # witte rand rondom (mm)
+    cell = size_mm + 2 * quiet
+    label_h = 7.0
+    cols = max(1, int((page_w / mm - 2 * 12) // cell))
+    rows = max(1, int((page_h / mm - 2 * 12 - 30) // (cell + label_h)))
+    per_page = cols * rows
+    c = canvas.Canvas(str(path), pagesize=A4)
+    ids = list(ids)
+    for p0 in range(0, len(ids), per_page):
+        chunk = ids[p0:p0 + per_page]
+        c.setFont("Helvetica", 8)
+        c.drawString(margin, page_h - margin + 2, f"foto2step markers {dict_name}  zijde zwart vierkant = {size_mm:.1f} mm   {title}")
+        c.drawString(margin, page_h - margin - 8,
+                     "PRINT OP 100% (geen 'passend maken'). Controleer de 100 mm lijn hieronder en meet elke marker na.")
+        # 100 mm reference
+        y_ref = page_h - margin - 18
+        c.setLineWidth(0.6)
+        c.line(margin, y_ref, margin + 100 * mm, y_ref)
+        for k in range(0, 101, 10):
+            c.line(margin + k * mm, y_ref - (3 if k % 50 == 0 else 1.5), margin + k * mm, y_ref + (3 if k % 50 == 0 else 1.5))
+        c.drawString(margin + 102 * mm, y_ref - 3, "100 mm")
+        top = page_h - margin - 30
+        for k, mid in enumerate(chunk):
+            r, col = divmod(k, cols)
+            x0 = margin + col * cell * mm
+            y0 = top - (r + 1) * (cell + label_h) * mm
+            img = marker_image(dict_name, mid, 800)
+            pil = Image.fromarray(img)
+            c.drawImage(ImageReader(pil), x0 + quiet * mm, y0 + (quiet + label_h) * mm, size_mm * mm, size_mm * mm)
+            c.setFont("Helvetica", 7)
+            c.drawString(x0 + quiet * mm, y0 + (label_h - 1) * mm, f"ID {mid}  ({size_mm:.1f} mm)")
+            # cut marks
+            c.setLineWidth(0.2)
+            c.rect(x0, y0, cell * mm, (cell + label_h) * mm)
+        c.showPage()
+    c.save()
+    return path

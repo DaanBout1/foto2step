@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.log
+work/
+output/
+/selftest_run/
+*.egg-info/
+.pytest_cache/
