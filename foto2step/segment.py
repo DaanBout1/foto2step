@@ -54,6 +54,8 @@ def patch_graph(V, F, patch, fn, adj):
     pa = patch[adj[:, 0]]
     pb = patch[adj[:, 1]]
     cross = pa != pb
+    if not cross.any():
+        return {}
     a = adj[cross]
     # shared edge length
     Fa = F[a[:, 0]]
@@ -84,6 +86,23 @@ def _sample_faces(V, F, faces, n, rng):
     return pts, faces[k]
 
 
+_FOV = {}
+
+
+def _fov_radius(cam):
+    key = id(cam)
+    r = _FOV.get(key)
+    if r is None:
+        w, h = cam.width, cam.height
+        pts = np.array([[0, 0], [w, 0], [0, h], [w, h], [w / 2, 0], [0, h / 2]], float)
+        try:
+            r = float(np.linalg.norm(np.asarray(cam.cam_from_img(pts)), axis=1).max()) * 1.02
+        except Exception:
+            r = 10.0
+        _FOV[key] = r
+    return r
+
+
 def evidence(q, nq, scene, cams, tau, max_cams=60):
     """Return (n_support, n_contra) per point for points q (state-S coords)."""
     n = len(q)
@@ -97,7 +116,10 @@ def evidence(q, nq, scene, cams, tau, max_cams=60):
     for cam, M, C in cam_list:
         pc = q @ M[:3, :3].T + M[:3, 3]
         z = pc[:, 2]
-        ok = z > 50.0
+        # guard against lens-distortion fold-back: only points inside the true field of view
+        rmax = _fov_radius(cam)
+        xn = pc[:, :2] / np.maximum(z[:, None], 1e-9)
+        ok = (z > 50.0) & (np.linalg.norm(xn, axis=1) < rmax)
         uv = np.full((n, 2), -1e9)
         if ok.any():
             uv[ok] = cam.img_from_cam(pc[ok], check_cheirality=False)
@@ -171,12 +193,13 @@ def label_reference(meshA, hyps: list, others: list, tol, tau, rng=None, manual=
     lab = -np.ones(nP, int)
     cand = {}
     split = []
+    active = [h for h, H in enumerate(hyps) if h == 0 or any(H["T"].get(o["state"]) is not None for o in others)]
     for p in range(nP):
-        ok = [h for h in range(nH) if fc[p, h] < 0.15 or info[p, h] < 8]
+        ok = [h for h in active if fc[p, h] < 0.15 or info[p, h] < 8]
         if len(ok) == 1:
             lab[p] = ok[0]
         elif len(ok) == 0:
-            lab[p] = int(np.argmin(fc[p]))
+            lab[p] = int(active[int(np.argmin(fc[p, active]))])
             if len(face_ids_by_patch[p]) > 50:
                 split.append(p)
         else:
@@ -219,13 +242,14 @@ def label_reference(meshA, hyps: list, others: list, tol, tau, rng=None, manual=
         cen = V[F[faces]].mean(1)
         _, nn = cKDTree(pts).query(cen)
         face_lab[faces] = best[nn]
+    names = [h["name"] for h in hyps]
     if manual:
-        face_lab = apply_manual(V, F, face_lab, manual, [h["name"] for h in hyps])
-    diag = {"n_patches": int(nP), "n_split": len(split), "n_ambiguous_initial": int(len(cand))}
+        face_lab = apply_manual(V, F, face_lab, manual, names)
+    diag = {"n_patches": int(nP), "n_split": len(split), "n_ambiguous_initial": int(len(cand)), "names": names}
     for h, H in enumerate(hyps):
         diag[f"faces_{H['name']}"] = int((face_lab == h).sum())
-    log(f"  segmentatie: {nP} vlakdelen, " + ", ".join(f"{H['name']}: {(face_lab == h).sum():,} driehoeken"
-                                                        for h, H in enumerate(hyps)))
+    log(f"  segmentatie: {nP} vlakdelen, " + ", ".join(f"{n}: {(face_lab == h).sum():,} driehoeken"
+                                                        for h, n in enumerate(names)))
     return face_lab, diag
 
 
@@ -259,7 +283,8 @@ def label_points(points, meshA, face_lab):
     return face_lab[pid], d
 
 
-def fuse_other_state(points_S, body_meshes_A: list, hyps: list, state: str, tau: float, grow_r: float):
+def fuse_other_state(points_S, body_meshes_A: list, hyps: list, state: str, tau: float, grow_r: float,
+                     normals_S=None):
     """Label points of state S by inverse-transforming each hypothesis onto the A-pose body meshes.
 
     Returns list (per body) of points expressed in A pose.
@@ -297,11 +322,15 @@ def fuse_other_state(points_S, body_meshes_A: list, hyps: list, state: str, tau:
         if cnt == 0:
             break
     out = []
+    out_n = []
     for h, H in enumerate(hyps):
         sel = lab == h
         T = H["T"].get(state)
         if T is None or not sel.any():
             out.append(np.zeros((0, 3)))
+            out_n.append(np.zeros((0, 3)))
         else:
-            out.append(to_h(np.linalg.inv(T), points_S[sel]))
-    return out, lab
+            Ti = np.linalg.inv(T)
+            out.append(to_h(Ti, points_S[sel]))
+            out_n.append(normals_S[sel] @ Ti[:3, :3].T if normals_S is not None else np.zeros((sel.sum(), 3)))
+    return out, out_n, lab

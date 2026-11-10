@@ -94,6 +94,9 @@ def detect_regions(V, F, tol_mm, angle_deg=12.0, min_area=400.0, cylinders=True)
                     c = S_c / S_a
                     C = S_cc / S_a - np.outer(c, c)
                     w, U = np.linalg.eigh(C)
+                    if w[1] < 10 * max(w[0], 1e-12):
+                        next_refit = int(len(members) * 1.5) + 1
+                        continue  # strip-like region: normal not yet well defined
                     nn = U[:, 0]
                     if nn @ n < 0:
                         nn = -nn
@@ -168,8 +171,9 @@ def _merge_coplanar(labels, regions, tri, area, tol_mm, ang_deg=2.0):
             c = ri["normal"] @ rj["normal"]
             if abs(c) < cos_a:
                 continue
-            sg = 1.0 if c > 0 else -1.0
-            if abs(ri["d"] - sg * rj["d"]) > tol_mm * 0.5:
+            ci = ri.setdefault("_c", tri[ri["faces"]].mean((0, 1)))
+            cj = rj.setdefault("_c", tri[rj["faces"]].mean((0, 1)))
+            if max(abs(cj @ ri["normal"] + ri["d"]), abs(ci @ rj["normal"] + rj["d"])) > tol_mm * 0.5:
                 continue
             # check: points of j lie on plane i within tolerance
             pj = tri[rj["faces"]].reshape(-1, 3)
@@ -190,6 +194,9 @@ def _merge_coplanar(labels, regions, tri, area, tol_mm, ang_deg=2.0):
         for k in mem:
             if k != root:
                 regions[k] = None
+    for r in regions:
+        if r is not None:
+            r.pop("_c", None)
 
 
 def snap(V, F, labels, regions, max_move, sharpen=True):
@@ -345,7 +352,7 @@ def regularize_mesh(mesh, noise_mm, cfg_f):
         if r is None:
             continue
         tot_area += r["area"]
-        d = {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in r.items() if k != "faces"}
+        d = {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in r.items() if k not in ("faces", "_c")}
         rep.append(d)
     a_all = float(mesh.get_surface_area())
     n_pl = sum(1 for r in rep if r["type"] == "plane")

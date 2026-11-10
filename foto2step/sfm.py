@@ -109,7 +109,7 @@ def _run_cli(image_dir, db, sparse, cfg_sfm, matcher, focal_prior):
            "--ImageReader.camera_model", cfg_sfm.get("camera_model", "OPENCV"),
            "--ImageReader.single_camera", "1" if cfg_sfm.get("single_camera", True) else "0",
            "--SiftExtraction.max_num_features", str(int(cfg_sfm.get("max_features", 16384))),
-           f"--{ext_prefix}.use_gpu", gpu]
+           f"--{ext_prefix}.use_gpu", gpu, f"--{ext_prefix}.max_image_size", "10000"]
     cp = _camera_params(cfg_sfm, focal_prior, image_dir)
     if cp:
         cmd += ["--ImageReader.camera_params", cp]

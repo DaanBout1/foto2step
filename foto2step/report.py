@@ -87,11 +87,12 @@ def write_report(work: Path, out: Path, cfg: dict, states: list):
         a("</table>")
     # parts
     a("<h2>STEP-onderdelen</h2><table><tr><th>Deel</th><th>Bestand</th><th>Type</th><th>B-rep vlakken</th>"
-      "<th>Afwijking mediaan / 95%</th><th>Vlakken / cilinders</th><th>Volume</th></tr>")
+      "<th>Afwijking mediaan / 95%</th><th>Ingevuld (niet gezien)</th><th>Vlakken / cilinders</th><th>Volume</th></tr>")
     for p in parts:
         a(f"<tr><td>{html.escape(p['name'])}</td><td>{html.escape(p['step'])}</td><td>{p['kind']}"
           f"{'' if p['valid'] else ' <b class=warn>(check)</b>'}</td><td>{p['readback']['faces']}</td>"
           f"<td>{_r(p['deviation_mm']['median'])} / {_r(p['deviation_mm']['p95'])} mm</td>"
+          f"<td>{p.get('filled_fraction', 0) * 100:.1f}%</td>"
           f"<td>{p['n_planes']} / {len(p['cylinders'])}</td><td>{_r(p['readback']['volume_mm3'] / 1e6, 3)} dm³</td></tr>")
     a("</table>")
     cyl = [(p["name"], c) for p in parts for c in p["cylinders"]]

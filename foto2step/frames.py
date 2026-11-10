@@ -30,7 +30,7 @@ def _exif_focal_px(path: Path, width: int, height: int):
             sub = ex.get_ifd(0x8769) if hasattr(ex, "get_ifd") else {}
             f35 = sub.get(0xA405) or ex.get(0xA405)
             if f35:
-                return float(f35) / 36.0 * max(width, height)
+                return float(f35) / 43.27 * float(np.hypot(width, height))
     except Exception:
         pass
     return None

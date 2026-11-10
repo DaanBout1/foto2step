@@ -89,10 +89,10 @@ def _dense_colmap(dense_dir, out_ply, cfg):
             pycolmap.patch_match_stereo(str(dense_dir), options=po)
             fo = pycolmap.StereoFusionOptions()
             fo.min_num_pixels = int(cfg["dense"].get("number_views_fuse", 3))
-            rec = pycolmap.stereo_fusion(str(out_ply), str(dense_dir), options=fo)
+            pycolmap.stereo_fusion(str(out_ply), str(dense_dir), input_type="geometric", options=fo, output_type="ply")
             return
-    except (ImportError, AttributeError, TypeError):
-        pass
+    except (ImportError, AttributeError, TypeError) as e:
+        log(f"  pycolmap dense niet beschikbaar ({e}), colmap CLI wordt gebruikt")
     b = cfg["sfm"].get("colmap_bin", "colmap")
     _sh([b, "patch_match_stereo", "--workspace_path", dense_dir, "--PatchMatchStereo.geom_consistency", "true",
          "--PatchMatchStereo.max_image_size", str(int(cfg["dense"].get("max_resolution", 4096)))])

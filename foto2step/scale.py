@@ -65,6 +65,8 @@ def triangulate_markers(recon, cams: dict, detections: dict, min_views: int = 3,
             keep = new_keep
         if X is None or keep.sum() < min_views:
             continue
+        idx = np.where(keep)[0]
+        X = triangulate_refine([P[i] for i in idx], [x[i] for i in idx], X, sigmas=1.0 / f[idx])
         err = _reproj_px(P, x, f, X)[keep]
         res.setdefault(mid, {})[k] = (X, int(keep.sum()), float(np.sqrt(np.mean(err ** 2))))
     out = {}
@@ -127,7 +129,8 @@ def estimate_scale(markers: dict, cfg_m: dict) -> dict:
             d_model = np.linalg.norm(markers[a]["corners"].mean(0) - markers[b]["corners"].mean(0))
             L = float(sb["distance_mm"])
             k = L / d_model
-            rel_sig = np.sqrt(2) * (sig_c / 2) / L
+            sL = float(sb.get("sigma_mm", 0.2))  # meetonzekerheid van de lat zelf (rolmaat/schuifmaat)
+            rel_sig = np.sqrt(2 * (sig_c / 2) ** 2 + sL ** 2) / L
             bars.append({"a": a, "b": b, "distance_mm": L, "mm_per_unit": k, "rel_sigma": float(rel_sig)})
         else:
             log(f"  WAARSCHUWING: schaallat {a}-{b}: marker(s) niet gevonden")
@@ -155,7 +158,7 @@ def estimate_scale(markers: dict, cfg_m: dict) -> dict:
         rel = out["markers"]["rel_se"]
         # systematic print/measure uncertainty of marker size (caliper ~0.05 mm)
         sizes = [v["size"] for v in per_marker.values()]
-        rel = float(np.sqrt(rel ** 2 + (0.05 / np.median(sizes)) ** 2))
+        rel = float(np.sqrt(rel ** 2 + (float(cfg_m.get("size_sigma_mm", 0.05)) / np.median(sizes)) ** 2))
         out["source"] = "markergrootte"
     out["mm_per_unit"] = k
     out["rel_sigma"] = rel
@@ -184,14 +187,21 @@ def world_frame(markers_mm: dict, cfg_m: dict, cam_centers_mm: np.ndarray):
         N.append(n)
     N = np.array(N)
     best = None
+    best_score = -1
     seed_ids = [ids.index(int(oid))] if oid is not None else range(len(ids))
     for si in seed_ids:
         n0 = N[si]
         d = np.abs((P - P[si]) @ n0)
         par = np.abs(N @ n0) > np.cos(np.radians(10))
         inl = (d < 15.0) & par
-        if best is None or inl.sum() > best.sum():
-            best = inl
+        # the floor has (almost) all cameras on one side; a machine wall does not
+        side = (cam_centers_mm - P[si]) @ n0
+        one_side = max(np.mean(side > 0), np.mean(side < 0))
+        score = inl.sum() + (1000 if one_side > 0.97 else 0)
+        if score > best_score:
+            best, best_score = inl, score
+    if oid is None:
+        log("  WAARSCHUWING: geen world.origin_id opgegeven; vloer automatisch gekozen. Geef liever een vloermarker op.")
     inl_ids = [ids[i] for i in np.where(best)[0]]
     if len(inl_ids) >= 3:
         pts = np.vstack([markers_mm[i]["corners"] for i in inl_ids])

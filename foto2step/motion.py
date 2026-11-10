@@ -47,8 +47,13 @@ def group_state(mA: dict, mS: dict, thresh: float, sigma: float):
             T = rigid_T(np.vstack([mA[j]["corners"] for j in ids]), np.vstack([mS[j]["corners"] for j in ids]))
         groups.append((ids, T))
         remaining = [j for j in remaining if j not in ids]
-    # the static group is the largest one that contains floor/origin markers -> choose largest
-    groups.sort(key=lambda g: -len(g[0]))
+    # The static group: world frames of both states are tied to the floor markers, so the true base
+    # moves least. Prefer groups that (almost) do not move, then the largest.
+    def _mv(g):
+        P = np.vstack([mA[j]["corners"] for j in g[0]])
+        return np.linalg.norm(to_h(g[1], P) - P, axis=1).max()
+
+    groups.sort(key=lambda g: (_mv(g) > max(thresh, 20.0), -len(g[0])))
     static_T = groups[0][1]
     # sanity: static motion should be tiny (world frames come from the same floor markers)
     ang = np.degrees(np.arccos(np.clip((np.trace(static_T[:3, :3]) - 1) / 2, -1, 1)))
@@ -97,6 +102,9 @@ def find_bodies(markers_by_state: dict, state_names: list, thresh: float, sigma:
     # resolve -1 entries
     resolved = {}
     for k, ids in groups.items():
+        if all(a == -1 for a in k):
+            log(f"  markers {sorted(ids)}: alleen in de referentiestand gezien, genegeerd voor beweging")
+            continue
         if -1 in k:
             match = [k2 for k2 in groups if -1 not in k2 and all(a == b or a == -1 for a, b in zip(k, k2))]
             if len(match) == 1:
@@ -122,6 +130,34 @@ def find_bodies(markers_by_state: dict, state_names: list, thresh: float, sigma:
                 T[s] = None
         name = "basis" if is_static else f"deel_{len(bodies)}"
         bodies.append({"name": name, "marker_ids": sorted(int(i) for i in ids), "T": T, "static": is_static})
+    # merge bodies whose transforms agree in every state where both are known (e.g. split by a missing marker)
+    merged = []
+    for b in bodies:
+        tgt = None
+        for m in merged:
+            same = True
+            for s in state_names[1:]:
+                Ta, Tb = m["T"].get(s), b["T"].get(s)
+                if Ta is None or Tb is None:
+                    continue
+                P = np.vstack([mA[i]["corners"] for i in b["marker_ids"] + m["marker_ids"]])
+                if np.linalg.norm(to_h(Ta, P) - to_h(Tb, P), axis=1).max() > max(4 * sigma, thresh / 2) * 2.5:
+                    same = False
+                    break
+            if same:
+                tgt = m
+                break
+        if tgt is None:
+            merged.append(b)
+        else:
+            tgt["marker_ids"] = sorted(tgt["marker_ids"] + b["marker_ids"])
+            for s in state_names[1:]:
+                if tgt["T"].get(s) is None:
+                    tgt["T"][s] = b["T"].get(s)
+    bodies = merged
+    for i, b in enumerate(bodies):
+        if not b["static"]:
+            b["name"] = f"deel_{i}"
     if not bodies or not bodies[0]["static"]:
         raise RuntimeError("Kon het vaste deel van de machine niet bepalen")
     return {"bodies": bodies, "statics": statics}

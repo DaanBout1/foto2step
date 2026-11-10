@@ -279,7 +279,7 @@ def _count(shape, kind):
     return n
 
 
-def write_step(parts: list, path: Path, assembly_name="machine"):
+def write_step(parts: list, path: Path, assembly_name="machine", schema="AP214"):
     """parts: list of (name, TopoDS_Shape, rgb tuple or None). Writes one STEP (single part or assembly)."""
     from OCP.TDocStd import TDocStd_Document
     from OCP.TCollection import TCollection_ExtendedString, TCollection_AsciiString
@@ -312,7 +312,7 @@ def write_step(parts: list, path: Path, assembly_name="machine"):
             comp = st.AddComponent(asm, plab, TopLoc_Location())
             TDataStd_Name.Set_s(comp, TCollection_ExtendedString(name))
         st.UpdateAssemblies()
-    Interface_Static.SetCVal_s("write.step.schema", "AP214IS")
+    Interface_Static.SetCVal_s("write.step.schema", {"AP203": "AP203", "AP214": "AP214IS", "AP242": "AP242DIS"}.get(schema, "AP214IS"))
     Interface_Static.SetCVal_s("write.step.unit", "MM")
     Interface_Static.SetCVal_s("write.step.product.name", assembly_name)
     w = STEPCAFControl_Writer()
