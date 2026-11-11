@@ -289,12 +289,17 @@ class Pipeline:
                 mesh, feat = regularize_mesh(mesh, noise, self.cfg["features"])
             ref_pts = np.asarray(pc.points)
             dec = meshing.decimate_bounded(mesh, max(cm["target_max_error_mm"], 1.5 * noise, 0.05), cm["max_triangles"])
+            if feat.get("regions"):
+                from .features import resnap
+                dec = resnap(dec, feat["regions"], feat["tolerance_mm"])
             a0 = dec.get_surface_area()
-            dec, nfill, nopen = meshing.close_mesh(dec, float(cm.get("fill_holes_mm", 3000.0)))
+            dec, nfill, nopen = meshing.close_mesh(dec, float(cm.get("fill_holes_mm", 3000.0)),
+                                                   force=bool(self.cfg["export"].get("force_solid", False)))
             _FILLED["area"] += max(dec.get_surface_area() - a0, 0.0)
             filled_area = _FILLED["area"]
             if nopen:
-                log(f"  WAARSCHUWING: {nopen} opening(en) blijven open -> STEP wordt een schil i.p.v. solid")
+                log(f"  LET OP: {nopen} grote, niet-gefotografeerde opening(en) blijven open -> STEP wordt een schil. "
+                    "Fotografeer die zijde (bv. onderkant) of zet export.force_solid: true")
             # accuracy: measured points -> final surface
             acc = _surface_dev(dec, ref_pts)
             o3d.io.write_triangle_mesh(str(self.work / "bodies" / f"{h:02d}_{name}_final.ply"), dec)

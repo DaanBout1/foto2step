@@ -420,3 +420,33 @@ def regularize_mesh(mesh, noise_mm, cfg_f):
     log(f"  features: {n_pl} vlakken, {n_cy} cilinders ({tot_area / max(a_all, 1):.0%} van oppervlak), "
         f"tol {tol:.2f} mm, {stats['snapped']:,} vertices gesnapt, {stats['sharpened']:,} randen aangescherpt")
     return m, {"tolerance_mm": tol, "regions": rep, "coverage": tot_area / max(a_all, 1), **stats}
+
+
+def resnap(mesh, regions_report, tol_mm, frac=0.35):
+    """Re-project vertices onto the detected planes after decimation (QEM breaks exact coplanarity).
+
+    A vertex within frac*tol of one plane goes onto it, of two planes onto their intersection line,
+    of three onto their corner point. Movements are bounded by frac*tol."""
+    import open3d as o3d
+    planes = [r for r in regions_report if r["type"] == "plane"]
+    if not planes:
+        return mesh
+    V = np.asarray(mesh.vertices).copy()
+    N = np.array([r["normal"] for r in planes], float)
+    D = np.array([r["d"] for r in planes], float)
+    lim = frac * tol_mm
+    dist = np.abs(V @ N.T + D[None, :])  # nV x nP (planes are few)
+    close = dist < lim
+    cnt = close.sum(1)
+    one = np.where(cnt == 1)[0]
+    if len(one):
+        k = close[one].argmax(1)
+        V[one] -= (np.einsum("ij,ij->i", V[one], N[k]) + D[k])[:, None] * N[k]
+    for v in np.where(cnt >= 2)[0]:
+        ks = np.where(close[v])[0]
+        q = _project_planes(V[v], [{"normal": N[k], "d": D[k]} for k in ks])
+        if q is not None and np.linalg.norm(q - V[v]) <= 2 * lim:
+            V[v] = q
+    mesh.vertices = o3d.utility.Vector3dVector(V)
+    mesh.compute_vertex_normals()
+    return mesh

@@ -434,7 +434,7 @@ def _fix_t_junctions(mesh):
     return mesh
 
 
-def close_mesh(mesh, max_radius=3000.0, rounds=5):
+def close_mesh(mesh, max_radius=3000.0, rounds=5, force=False):
     """Alternate hole filling and manifold repair until the mesh is closed (or no further progress)."""
     total = left = 0
     for _ in range(rounds):
@@ -444,7 +444,7 @@ def close_mesh(mesh, max_radius=3000.0, rounds=5):
         mesh = _fix_t_junctions(mesh)
         if not boundary_loops(np.asarray(mesh.triangles)):
             break
-        mesh, n, left = fill_holes(mesh, max_radius)
+        mesh, n, left = fill_holes(mesh, max_radius, zipper_max_mm=(1e9 if force else 60.0))
         total += n
         if n == 0:
             break

@@ -74,6 +74,7 @@ DEFAULTS = {
         "verify_readback": "auto",  # STEP teruglezen met OpenCASCADE ter controle (auto: tot 60k vlakken)
         "merge_coplanar": True,
         "urdf": True,
+        "force_solid": False,     # true = ook grote ongeziene openingen dichtmaken (altijd solid, minder nauwkeurig daar)
     },
     "states": [],                 # [{name: A, images: pad/naar/fotos_of_video}]
 }
