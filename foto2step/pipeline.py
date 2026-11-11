@@ -260,6 +260,15 @@ class Pipeline:
             if len(pc.points) < 500:
                 log(f"  {name}: te weinig punten ({len(pc.points)}), overgeslagen")
                 continue
+            pj = bdir / f"{h:02d}_{name}_part.json"
+            path = pdir / f"{name}.step"
+            if pj.exists() and path.exists() and not self.force:
+                from .stepexport import read_step_shape
+                rgb = PART_COLORS[h % len(PART_COLORS)]
+                shapes.append((name, read_step_shape(path), rgb))
+                part_info.append(json.loads(pj.read_text()))
+                log(f"[deel {name}] al klaar (hervat)")
+                continue
             log(f"[deel {name}] mesh + STEP ({len(pc.points):,} punten)")
             pc = pc.voxel_down_sample(cm["voxel_mm"] * 0.7)
             if pc.has_normals() and np.any(np.asarray(pc.normals)):
@@ -291,7 +300,6 @@ class Pipeline:
             F = np.asarray(dec.triangles)
             shp, sinfo = mesh_to_shape(V, F, self.cfg["export"].get("merge_coplanar", True))
             rgb = PART_COLORS[h % len(PART_COLORS)]
-            path = pdir / f"{name}.step"
             write_step([(name, shp, rgb)], path, name, self.cfg["export"].get("step_schema", "AP214"))
             chk = read_step_check(path)
             log(f"  {path.name}: {sinfo['kind']}, {chk['faces']} vlakken (uit {sinfo['triangles']} driehoeken), "
@@ -305,6 +313,7 @@ class Pipeline:
                               "cylinders": [{"radius": r["radius"], "diameter": 2 * r["radius"], "axis": r["axis"],
                                              "point": r["point"], "length": r["length"], "rms": r["rms"]}
                                             for r in feat.get("regions", []) if r["type"] == "cylinder"]})
+            pj.write_text(json.dumps(part_info[-1], indent=1, default=_np))
         if not shapes:
             raise RuntimeError("Geen enkel onderdeel kon worden opgebouwd (te weinig punten). Zie fotoprotocol.")
         asm = self.out / f"{self.cfg['project']}_samenstelling.step"

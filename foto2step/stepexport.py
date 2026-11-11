@@ -374,3 +374,15 @@ def read_step_check(path: Path) -> dict:
     x0, y0, z0, x1, y1, z1 = cmin.X(), cmin.Y(), cmin.Z(), cmax.X(), cmax.Y(), cmax.Z()
     return {"volume_mm3": float(vol), "area_mm2": float(sp.Mass()), "bbox": [x0, y0, z0, x1, y1, z1],
             "solids": _count(shp, TopAbs_SOLID), "shells": _count(shp, TopAbs_SHELL), "faces": _count(shp, TopAbs_FACE)}
+
+
+def read_step_shape(path: Path):
+    from OCP.STEPControl import STEPControl_Reader
+    from OCP.IFSelect import IFSelect_RetDone
+    r = STEPControl_Reader()
+    with _quiet():
+        ok = r.ReadFile(str(path))
+    if ok != IFSelect_RetDone:
+        raise RuntimeError(f"STEP niet leesbaar: {path}")
+    r.TransferRoots()
+    return r.OneShape()

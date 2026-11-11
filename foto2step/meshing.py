@@ -152,7 +152,7 @@ def decimate_bounded(mesh, max_err_mm=0.15, max_tris=400000, ref_pts=None):
     best_err = 0.0
     target = n
     while target > 1000:
-        target = int(target * 0.7)
+        target = int(target * 0.5)
         cand = mesh.simplify_quadric_decimation(target)
         err = err_of(cand)
         if err > max_err_mm:
@@ -238,14 +238,23 @@ def fill_holes(mesh, max_radius=3000.0, planar_tol=None):
         rms = float(np.sqrt(np.mean((X @ n) ** 2)))
         tol = planar_tol if planar_tol else max(0.02 * rad, 0.5)
         # boundary follows triangle winding: the cap must have the opposite orientation
-        if rms <= tol:
+        # (non-planar loops, e.g. unobservable contact areas between parts, are still capped when their
+        # projection is a simple polygon: checked by area consistency of the triangulation)
+        if rms <= max(tol, 0.15 * rad):
             e1, e2 = Vt[0], Vt[1]
             uv = np.c_[X @ e1, X @ e2].astype(np.float64)
             try:
                 tri = earcut.triangulate_float64(uv, np.array([len(uv)], np.uint32)).reshape(-1, 3)
             except Exception:
                 tri = np.zeros((0, 3), int)
+            simple = False
             if len(tri) == len(lp) - 2:
+                e1 = uv[tri[:, 1]] - uv[tri[:, 0]]
+                e2 = uv[tri[:, 2]] - uv[tri[:, 0]]
+                ta = 0.5 * np.abs(e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]).sum()
+                pa = 0.5 * abs(np.sum(uv[:, 0] * np.roll(uv[:, 1], -1) - np.roll(uv[:, 0], -1) * uv[:, 1]))
+                simple = pa > 0 and abs(ta - pa) <= 0.01 * pa
+            if simple:
                 # orientation: compare with loop direction
                 lpa = np.array(lp)
                 T = lpa[tri]
