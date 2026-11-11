@@ -40,24 +40,52 @@ def write_report(work: Path, out: Path, cfg: dict, states: list):
     H = []
     a = H.append
     a("<!DOCTYPE html><html lang='nl'><head><meta charset='utf-8'><title>foto2step rapport</title>")
-    a("<style>body{font-family:system-ui,Segoe UI,Arial;margin:2rem;max-width:1100px;color:#222}"
-      "table{border-collapse:collapse;margin:.5rem 0 1.5rem}td,th{border:1px solid #ccc;padding:.3rem .6rem;text-align:left}"
-      "th{background:#f2f2f2}.ok{color:#17803d}.warn{color:#b26b00}.bad{color:#c0262d}.big{font-size:1.4rem}</style></head><body>")
-    a(f"<h1>foto2step rapport: {html.escape(cfg['project'])}</h1>")
+    a("<style>"
+      ":root{--ink:#1d2329;--mut:#5b6670;--line:#e3e7eb;--bg:#f6f8fa;--ok:#17803d;--warn:#b26b00;--bad:#c0262d;--acc:#1f5fbf}"
+      "*{box-sizing:border-box}body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:0;"
+      "color:var(--ink);background:var(--bg);line-height:1.45}"
+      ".wrap{max-width:1120px;margin:0 auto;padding:28px 24px 60px}"
+      "header{background:#fff;border-bottom:1px solid var(--line)}header .wrap{padding:22px 24px}"
+      "h1{font-size:1.5rem;margin:0}h2{font-size:1.1rem;margin:2rem 0 .6rem}.sub{color:var(--mut);margin-top:.2rem}"
+      ".cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin:18px 0}"
+      ".card{background:#fff;border:1px solid var(--line);border-radius:10px;padding:14px 16px}"
+      ".card .k{color:var(--mut);font-size:.82rem}.card .v{font-size:1.45rem;font-weight:650;margin-top:2px}"
+      ".panel{background:#fff;border:1px solid var(--line);border-radius:10px;padding:6px 6px;overflow-x:auto}"
+      "table{border-collapse:collapse;width:100%;font-size:.9rem}td,th{padding:.45rem .7rem;text-align:left;"
+      "border-bottom:1px solid var(--line);white-space:nowrap}th{color:var(--mut);font-weight:600;font-size:.8rem;"
+      "text-transform:uppercase;letter-spacing:.03em}tr:last-child td{border-bottom:none}"
+      ".ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}"
+      ".note{color:var(--mut);font-size:.88rem}.preview{width:100%;border-radius:10px;border:1px solid var(--line);background:#fff}"
+      "ul.adv li{margin:.3rem 0}</style></head><body>")
+    import time as _t
+    a(f"<header><div class='wrap'><h1>{html.escape(cfg['project'])}</h1>"
+      f"<div class='sub'>foto2step rapport · {_t.strftime('%d-%m-%Y %H:%M')} · {len(states)} stand(en) · "
+      f"{len(parts)} onderdeel/onderdelen</div></div></header><div class='wrap'>")
     est = acc["estimate_95_mm"]
     cls = "ok" if est <= 0.5 else "warn" if est <= 2 else "bad"
-    a(f"<p class='big'>Geschatte nauwkeurigheid (95%): <b class='{cls}'>± {_r(est)} mm</b> "
-      f"over {_r(acc['extent_mm'] / 1000, 2)} m meetvolume</p>")
-    a("<p>Opgebouwd uit: schaalonzekerheid over het hele meetvolume (2σ) "
-      f"{_r(acc['scale_2sigma_at_extent_mm'])} mm, oppervlakte-afwijking meetpunten→STEP (95%) "
-      f"{_r(acc['surface_p95_mm'])} mm"
-      + (f", grootste fout op onafhankelijke controlematen {_r(acc['check_max_abs_mm'])} mm" if acc['check_max_abs_mm'] is not None
-         else ". <b class='warn'>Geen controlematen opgegeven: zet 'check_distances' in de config voor een onafhankelijke toets.</b>")
-      + "</p>")
-    a("<p><i>Let op: dit geldt voor oppervlakken die goed op de foto's stonden. Gaten, blinde hoeken en glimmende/zwarte "
-      "vlakken zijn ingevuld/geïnterpoleerd en kunnen meer afwijken.</i></p>")
+    chk = acc["check_max_abs_mm"]
+    a("<div class='cards'>"
+      f"<div class='card'><div class='k'>Geschatte nauwkeurigheid (95%)</div><div class='v {cls}'>± {_r(est)} mm</div></div>"
+      f"<div class='card'><div class='k'>Meetvolume</div><div class='v'>{_r(acc['extent_mm'] / 1000, 2)} m</div></div>"
+      f"<div class='card'><div class='k'>Schaal (2σ over meetvolume)</div><div class='v'>{_r(acc['scale_2sigma_at_extent_mm'])} mm</div></div>"
+      f"<div class='card'><div class='k'>Oppervlak punten→STEP (95%)</div><div class='v'>{_r(acc['surface_p95_mm'])} mm</div></div>"
+      f"<div class='card'><div class='k'>Controlematen (max. fout)</div><div class='v'>"
+      + (f"{_r(chk)} mm" if chk is not None else "<span class='warn'>geen</span>") + "</div></div></div>")
+    if chk is None:
+        a("<p class='note warn'>Geen controlematen opgegeven: zet 'check_distances' in de config voor een onafhankelijke toets.</p>")
+    a("<p class='note'>De nauwkeurigheid geldt voor oppervlakken die goed op de foto's stonden. Ingevulde gaten, blinde hoeken en "
+      "glimmende/zwarte vlakken kunnen meer afwijken (zie kolom 'Ingevuld').</p>")
+    try:
+        from .preview import load_final_meshes, render_parts_png
+        from .pipeline import PART_COLORS
+        if bodies.get("bodies"):
+            ms = load_final_meshes(work, bodies["bodies"])
+            img = render_parts_png(ms, [PART_COLORS[i % len(PART_COLORS)] for i in range(len(ms))])
+            a(f"<h2>Resultaat</h2><img class='preview' src='{img}' alt='voorbeeld'>")
+    except Exception as e:  # preview is optional
+        a(f"<p class='note'>(voorbeeldafbeelding niet beschikbaar: {html.escape(str(e))})</p>")
     # per state
-    a("<h2>Per stand</h2><table><tr><th>Stand</th><th>Beelden</th><th>Reproj. fout</th><th>Markers</th>"
+    a("<h2>Per stand</h2><div class='panel'><table><tr><th>Stand</th><th>Beelden</th><th>Reproj. fout</th><th>Markers</th>"
       "<th>Schaal-onzekerheid</th><th>Hoekpunt-precisie</th><th>Vloervlak RMS</th><th>Ruis</th></tr>")
     for s in states:
         d = work / s
@@ -69,7 +97,7 @@ def write_report(work: Path, out: Path, cfg: dict, states: list):
           f"<td>{_r(sfm.get('mean_reproj_px'), 3)} px</td><td>{len(mk)}</td>"
           f"<td>{_r(cal['scale']['rel_sigma'] * 1e3, 3)} mm/m</td><td>{_r(cal['scale']['sigma_corner_mm'], 3)} mm</td>"
           f"<td>{_r(cal['frame']['floor_plane_rms_mm'], 3)} mm</td><td>{_r(nz, 3)} mm</td></tr>")
-    a("</table>")
+    a("</table></div>")
     rows = []
     for s in states:
         cal = json.loads((work / s / "calibration.json").read_text())
@@ -78,15 +106,15 @@ def write_report(work: Path, out: Path, cfg: dict, states: list):
         for b in cal["scale"].get("bars", []):
             pass
     if rows:
-        a("<h2>Onafhankelijke controlematen</h2><table><tr><th>Stand</th><th>Markers</th><th>Gemeten</th><th>Uit foto's</th><th>Fout</th></tr>")
+        a("<h2>Onafhankelijke controlematen</h2><div class='panel'><table><tr><th>Stand</th><th>Markers</th><th>Gemeten</th><th>Uit foto's</th><th>Fout</th></tr>")
         for s, c in rows:
             e = abs(c["error_mm"])
             k = "ok" if e <= 0.5 else "warn" if e <= 2 else "bad"
             a(f"<tr><td>{s}</td><td>{c['a']}–{c['b']}</td><td>{_r(c['measured_mm'])}</td><td>{_r(c['photo_mm'])}</td>"
               f"<td class='{k}'>{c['error_mm']:+.2f} mm</td></tr>")
-        a("</table>")
+        a("</table></div>")
     # parts
-    a("<h2>STEP-onderdelen</h2><table><tr><th>Deel</th><th>Bestand</th><th>Type</th><th>B-rep vlakken</th>"
+    a("<h2>STEP-onderdelen</h2><div class='panel'><table><tr><th>Deel</th><th>Bestand</th><th>Type</th><th>B-rep vlakken</th>"
       "<th>Afwijking mediaan / 95%</th><th>Ingevuld (niet gezien)</th><th>Vlakken / cilinders</th><th>Volume</th></tr>")
     for p in parts:
         a(f"<tr><td>{html.escape(p['name'])}</td><td>{html.escape(p['step'])}</td><td>{p['kind']}"
@@ -94,16 +122,16 @@ def write_report(work: Path, out: Path, cfg: dict, states: list):
           f"<td>{_r(p['deviation_mm']['median'])} / {_r(p['deviation_mm']['p95'])} mm</td>"
           f"<td>{p.get('filled_fraction', 0) * 100:.1f}%</td>"
           f"<td>{p['n_planes']} / {len(p['cylinders'])}</td><td>{_r(p['readback']['volume_mm3'] / 1e6, 3)} dm³</td></tr>")
-    a("</table>")
+    a("</table></div>")
     cyl = [(p["name"], c) for p in parts for c in p["cylinders"]]
     if cyl:
-        a("<h2>Gevonden cilinders (assen, gaten, buizen)</h2><table><tr><th>Deel</th><th>Ø</th><th>Lengte</th><th>As-richting</th><th>RMS</th></tr>")
+        a("<h2>Gevonden cilinders (assen, gaten, buizen)</h2><div class='panel'><table><tr><th>Deel</th><th>Ø</th><th>Lengte</th><th>As-richting</th><th>RMS</th></tr>")
         for n, c in sorted(cyl, key=lambda x: -x[1]["length"])[:60]:
             a(f"<tr><td>{html.escape(n)}</td><td>{_r(c['diameter'])} mm</td><td>{_r(c['length'], 1)} mm</td>"
               f"<td>{', '.join(_r(v, 3) for v in c['axis'])}</td><td>{_r(c['rms'], 3)}</td></tr>")
-        a("</table>")
+        a("</table></div>")
     if bodies.get("joints"):
-        a("<h2>Bewegingen</h2><table><tr><th>Deel</th><th>Type</th><th>As</th><th>Standen</th></tr>")
+        a("<h2>Bewegingen</h2><div class='panel'><table><tr><th>Deel</th><th>Type</th><th>As</th><th>Standen</th></tr>")
         for j in bodies["joints"]:
             if j["type"] == "prismatic":
                 st = ", ".join(f"{k}: {v:+.2f} mm" for k, v in j["positions_mm"].items())
@@ -114,7 +142,7 @@ def write_report(work: Path, out: Path, cfg: dict, states: list):
             else:
                 st, ax = "-", "-"
             a(f"<tr><td>{html.escape(j['body'])}</td><td>{j['type']}</td><td>{ax}</td><td>{st}</td></tr>")
-        a("</table>")
+        a("</table></div>")
     # advice
     adv = []
     cal0 = json.loads((work / states[0] / "calibration.json").read_text())
@@ -127,7 +155,7 @@ def write_report(work: Path, out: Path, cfg: dict, states: list):
     if cal0["scale"]["sigma_corner_mm"] > 0.3:
         adv.append("Marker-hoekpunten zijn onnauwkeurig: scherpere foto's, markers vlak geplakt, mat papier, geen bewegingsonscherpte.")
     if adv:
-        a("<h2>Advies voor een nauwkeuriger resultaat</h2><ul>" + "".join(f"<li>{html.escape(x)}</li>" for x in adv) + "</ul>")
-    a("</body></html>")
+        a("<h2>Advies voor een nauwkeuriger resultaat</h2><ul class='adv'>" + "".join(f"<li>{html.escape(x)}</li>" for x in adv) + "</ul>")
+    a("</div></body></html>")
     (out / "rapport.html").write_text("\n".join(H), encoding="utf-8")
     (out / "nauwkeurigheid.json").write_text(json.dumps(acc, indent=1))
