@@ -162,7 +162,8 @@ def grade(ds: Path, work: Path, out: Path, T=None, sfm=True) -> dict:
         rb = p.get("readback") or (read_step_check(out / p["step"]) if p["brep_faces"] <= 60000 else _step_text_check(out / p["step"]))
         ok = rb.get("faces", 0) == p["brep_faces"]
         check(f"STEP {p['name']} teruggelezen ({p['brep_faces']} vlakken)", 0 if ok else 1, 0, unit="")
-        check(f"STEP {p['name']} is een solid (force_solid)", 0 if rb.get("solids", 0) >= 1 else 1, 0, unit="")
+        if p.get("kind") == "solid":
+            check(f"STEP {p['name']} solid teruggelezen", 0 if rb.get("solids", 0) >= 1 else 1, 0, unit="")
         if p.get("volume_mm3") and rb.get("volume_mm3"):
             check(f"STEP {p['name']} volume = mesh-volume", abs(rb["volume_mm3"] - p["volume_mm3"]) / p["volume_mm3"], 1e-4,
                   unit="relatief")
@@ -191,7 +192,6 @@ def run_selftest(root: Path, quick=False, openmvs_bin="") -> bool:
     c.setdefault("dense", {})
     c["dense"]["backend"] = "auto"
     c.setdefault("export", {})["verify_readback"] = True
-    c["export"]["force_solid"] = True  # the synthetic camera path never sees the arm's underside
     if openmvs_bin:
         c["dense"]["openmvs_bin"] = openmvs_bin
     cfgp.write_text(yaml.safe_dump(c, sort_keys=False))

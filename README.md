@@ -156,3 +156,21 @@ Delen handmatig afbakenen (ook met maar 1 stand): `motion: manual_bodies: [{name
 twee standen) als telefoonfoto's met lensvertekening, ruis en JPEG, draait de volledige pijplijn en vergelijkt
 alles met de exacte maten: markerposities, controlematen, cameraposities, aantal delen, as-richting, slag, hoek,
 draaipunt, segmentatie, oppervlakte-afwijking, volledigheid en STEP-geldigheid. Unit tests: `pytest -q`.
+
+## Gauntlet-resultaat (laatste run)
+
+Synthetische machine (frame 1,2 m + kolom, lineaire slede 150 mm, draaiarm 30°), 79–80 foto's per stand,
+1600×1200 px, dichte reconstructie op **halve resolutie** (CPU-testomgeving). Alles vergeleken met exacte maten:
+
+| Controle | Resultaat |
+|---|---|
+| Controlematen 2,2 m / 2,5 m (onafhankelijk) | 0,02 / 0,20 mm |
+| Marker-hoekpunten 3D (95%) | 0,9 mm |
+| Bewegende delen gevonden | 2 van 2, juiste type |
+| Slede: as-richting / slag | 0,07° / 0,11 mm |
+| Draaiarm: as-richting / hoek / draaipunt | 0,08° / 0,005° / 0,18 mm |
+| Frame: oppervlak mediaan / 95% / volledigheid | 0,13 mm / 0,96 mm / 97% |
+| Segmentatie (oppervlak bij juiste deel) | frame 98%, slede 97%, arm 99,7% |
+| Arm: oppervlak | mediaan ~1 mm: de onderkant is in deze test nooit gefotografeerd |
+
+Les: wat niet gefotografeerd is, kan niet nauwkeurig worden. Fotografeer bewegende delen ook van onderen.
