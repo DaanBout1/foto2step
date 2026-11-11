@@ -27,7 +27,7 @@ def _scene(mesh):
     return sc
 
 
-def make_patches(V, F, tol, angle_deg=12.0, crease_deg=35.0):
+def make_patches(V, F, tol, angle_deg=12.0, crease_deg=35.0, chunk_mm=25.0):
     labels, regions = detect_regions(V, F, tol, angle_deg, min_area=200.0, cylinders=True)
     patch = labels.copy()
     nxt = len(regions)
@@ -40,10 +40,14 @@ def make_patches(V, F, tol, angle_deg=12.0, crease_deg=35.0):
     sel = free[adj[:, 0]] & free[adj[:, 1]] & (dots > np.cos(np.radians(crease_deg)))
     A = coo_matrix((np.ones(sel.sum()), (adj[sel, 0], adj[sel, 1])), shape=(len(F), len(F)))
     _, comp = connected_components(A, directed=False)
-    for c in np.unique(comp[free]):
-        m = free & (comp == c)
-        patch[m] = nxt
-        nxt += 1
+    # leftover (free-form / rounded) faces: split components into spatial chunks so that a component
+    # spanning two parts (e.g. a rounded contact edge) can be divided between them
+    cen = tri.mean(1)
+    cell = np.floor(cen / chunk_mm).astype(np.int64)
+    key = comp.astype(np.int64) * 1_000_003 + ((cell[:, 0] * 73856093) ^ (cell[:, 1] * 19349663) ^ (cell[:, 2] * 83492791))
+    fk = key[free]
+    _, inv = np.unique(fk, return_inverse=True)
+    patch[free] = nxt + inv
     # relabel compactly
     u, patch = np.unique(patch, return_inverse=True)
     return patch, fn, adj
@@ -148,7 +152,12 @@ def evidence(q, nq, scene, cams, tau, max_cams=60):
     return sup, con
 
 
-def label_reference(meshA, hyps: list, others: list, tol, tau, rng=None, manual=None):
+def _patch_area(V, F, faces):
+    t = V[F[faces]]
+    return float(0.5 * np.linalg.norm(np.cross(t[:, 1] - t[:, 0], t[:, 2] - t[:, 0]), axis=1).sum())
+
+
+def label_reference(meshA, hyps: list, others: list, tol, tau, rng=None, manual=None, smooth_mm=8.0):
     """Label faces of the reference mesh.
 
     hyps: list of dicts {name, T: {state: 4x4 A->state}} (index 0 = static/basis).
@@ -189,42 +198,34 @@ def label_reference(meshA, hyps: list, others: list, tol, tau, rng=None, manual=
                 n_inf += informed.sum()
             fc[p, h] = n_con / max(n_inf, 1)
             info[p, h] = n_inf
-    # decide per patch
-    lab = -np.ones(nP, int)
-    cand = {}
-    split = []
+    # ---- global labelling: unary (evidence) + boundary smoothness, minimised with ICM
     active = [h for h, H in enumerate(hyps) if h == 0 or any(H["T"].get(o["state"]) is not None for o in others)]
-    for p in range(nP):
-        ok = [h for h in active if fc[p, h] < 0.15 or info[p, h] < 8]
-        if len(ok) == 1:
-            lab[p] = ok[0]
-        elif len(ok) == 0:
-            lab[p] = int(active[int(np.argmin(fc[p, active]))])
-            if len(face_ids_by_patch[p]) > 50:
-                split.append(p)
-        else:
-            cand[p] = ok
-    # propagate ambiguous patches through the patch graph
+    p_area = np.array([_patch_area(V, F, face_ids_by_patch[p]) for p in range(nP)])
+    conf = np.minimum(info, 60.0) / 60.0
+    U = p_area[:, None] * fc * conf * 4.0          # contradicted surface costs (mm^2)
+    U[:, [h for h in range(nH) if h not in active]] = np.inf
+    U[:, 1:] += 1e-3 * p_area[:, None]              # tiny prior: unexplained surface belongs to the base
     nbrs = {}
     for (i, j), w in G.items():
-        nbrs.setdefault(i, []).append((j, w))
-        nbrs.setdefault(j, []).append((i, w))
-    changed = True
-    it = 0
-    while changed and cand and it < 200:
-        changed = False
-        it += 1
-        for p in list(cand):
-            score = {}
+        nbrs.setdefault(i, []).append((j, w * smooth_mm))
+        nbrs.setdefault(j, []).append((i, w * smooth_mm))
+    lab = np.argmin(U, axis=1)
+    order = np.argsort(-p_area)
+    for it in range(60):
+        changed = 0
+        for p in order:
+            cost = U[p].copy()
             for q_, w in nbrs.get(p, []):
-                if lab[q_] >= 0 and lab[q_] in cand[p]:
-                    score[lab[q_]] = score.get(lab[q_], 0) + w
-            if score:
-                lab[p] = max(score, key=score.get)
-                del cand[p]
-                changed = True
-    for p, c in cand.items():
-        lab[p] = c[0]
+                cost += w
+                cost[lab[q_]] -= w
+            nl = int(np.argmin(cost))
+            if nl != lab[p]:
+                lab[p] = nl
+                changed += 1
+        if changed == 0:
+            break
+    split = [p for p in range(nP) if fc[p, lab[p]] > 0.3 and info[p, lab[p]] >= 20 and len(face_ids_by_patch[p]) > 50]
+    cand = {}
     face_lab = lab[patch]
     # split patches where no hypothesis fits: per face, best hypothesis from point evidence
     for p in split:
@@ -245,7 +246,7 @@ def label_reference(meshA, hyps: list, others: list, tol, tau, rng=None, manual=
     names = [h["name"] for h in hyps]
     if manual:
         face_lab = apply_manual(V, F, face_lab, manual, names)
-    diag = {"n_patches": int(nP), "n_split": len(split), "n_ambiguous_initial": int(len(cand)), "names": names}
+    diag = {"n_patches": int(nP), "n_split": len(split), "icm_iterations": it + 1, "names": names}
     for h, H in enumerate(hyps):
         diag[f"faces_{H['name']}"] = int((face_lab == h).sum())
     log(f"  segmentatie: {nP} vlakdelen, " + ", ".join(f"{n}: {(face_lab == h).sum():,} driehoeken"
