@@ -19,5 +19,6 @@ dependencies:
       - trimesh
       - cadquery-ocp
       - mapbox_earcut
+      - fast-simplification
       - pillow-heif
       - -e .

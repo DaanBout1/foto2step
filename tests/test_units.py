@@ -206,3 +206,16 @@ def test_stepwriter_part_and_assembly(tmp_path):
     assert c["solids"] == 2 and abs(c["volume_mm3"] - (150000 + b.volume)) < 1e-2
     txt = (tmp_path / "s.step").read_text()
     assert "NEXT_ASSEMBLY_USAGE_OCCURRENCE" in txt and "'bol'" in txt
+
+
+def test_cylinder_from_plane_strips():
+    from foto2step.features import regularize_mesh
+    import open3d as o3d
+    rng = np.random.default_rng(1)
+    c = trimesh.creation.cylinder(radius=30, height=200, sections=128).subdivide().subdivide()
+    V = c.vertices + rng.normal(0, 0.03, c.vertices.shape)
+    om = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(V), o3d.utility.Vector3iVector(c.faces))
+    out, rep = regularize_mesh(om, 0.1, {"angle_deg": 12, "min_region_area_mm2": 100, "cylinders": True, "sharpen_edges": True})
+    cyl = [r for r in rep["regions"] if r["type"] == "cylinder"]
+    assert len(cyl) >= 1
+    assert abs(max(cyl, key=lambda r: r["area"])["radius"] - 30) < 0.1

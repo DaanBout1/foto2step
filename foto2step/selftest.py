@@ -99,11 +99,12 @@ def grade(ds: Path, work: Path, out: Path, T=None, sfm=True) -> dict:
             check(f"slag {j['body']}", abs(abs(j["positions_mm"]["B"]) - g["travel"]), 0.5)
         if g["type"] == "revolute" and j["type"] == "revolute":
             check(f"hoek {j['body']}", abs(abs(j["angles_deg"]["B"]) - g["angle_deg"]), 0.1, unit="graden")
+            # distance between estimated and true axis, at the height of the part (the reported point)
             p = np.array(j["point"])
             gp_ = to_h(T, np.array(g["point"], float)[None])[0]
             d = p - gp_
             d -= (d @ gax) * gax
-            check(f"draaias-positie {j['body']}", np.linalg.norm(d), 1.0)
+            check(f"draaias-positie {j['body']} (op hoogte van het deel)", np.linalg.norm(d), 1.0)
     # 3. parts vs ground truth
     parts = json.loads((work / "parts.json").read_text())
     gtm = {}

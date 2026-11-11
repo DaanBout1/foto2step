@@ -303,10 +303,13 @@ def fuse_other_state(points_S, body_meshes_A: list, hyps: list, state: str, tau:
     srt = np.sort(D, axis=1)
     margin = srt[:, 1] - srt[:, 0] if nH > 1 else np.full(len(D), np.inf)
     lab = np.where((dmin < tau) & (margin > tau * 0.5), best, -1)
-    # region growing into newly visible surfaces
+    # region growing into newly visible surfaces: a point may only adopt a neighbour's body if, moved back
+    # with that body's motion, it lies close (< grow_max) to that body's reference surface
+    grow_max = max(10 * tau, 25.0)
+    allowed = D < grow_max
     tree = cKDTree(points_S)
-    for _ in range(60):
-        un = np.where(lab < 0)[0]
+    for _ in range(40):
+        un = np.where((lab < 0) & allowed.any(1))[0]
         if not len(un):
             break
         nn = tree.query_ball_point(points_S[un], grow_r)
@@ -314,7 +317,8 @@ def fuse_other_state(points_S, body_meshes_A: list, hyps: list, state: str, tau:
         cnt = 0
         for i, lst in zip(un, nn):
             ls = lab[lst]
-            ls = ls[ls >= 0]
+            ls = ls[(ls >= 0)]
+            ls = ls[allowed[i, ls]] if len(ls) else ls
             if len(ls):
                 vals, c = np.unique(ls, return_counts=True)
                 new[i] = vals[np.argmax(c)]

@@ -113,6 +113,8 @@ def detect_regions(V, F, tol_mm, angle_deg=12.0, min_area=400.0, cylinders=True)
         regions.append({"type": "plane", "normal": n, "d": d, "rms": rms, "area": float(area[m].sum()), "faces": m})
     labels[labels == -2] = -1
     _merge_coplanar(labels, regions, tri, area, tol_mm)
+    if cylinders:
+        _strips_to_cylinders(labels, regions, tri, area, fn, adj, cen, tol_mm)
     # ---------------- cylinders on remaining smooth patches
     if cylinders:
         free = labels == -1
@@ -148,6 +150,64 @@ def detect_regions(V, F, tol_mm, angle_deg=12.0, min_area=400.0, cylinders=True)
                             "rms": cyl["rms"], "area": float(area[m].sum()), "faces": m,
                             "length": float(np.ptp(t)), "coverage_deg": float(min(cover, 360))})
     return labels, regions
+
+
+def _strips_to_cylinders(labels, regions, tri, area, fn, adj, cen, tol_mm, max_dihedral=25.0):
+    """Plane growing chops a cylinder into narrow planar strips. Chains of adjacent plane regions that meet at
+    small angles are tested as one cylinder; if it fits, they are replaced by a cylinder region."""
+    la = labels[adj[:, 0]]
+    lb = labels[adj[:, 1]]
+    m = (la >= 0) & (lb >= 0) & (la != lb)
+    pairs = set()
+    for a, b in zip(la[m], lb[m]):
+        ra, rb = regions[a], regions[b]
+        if ra is None or rb is None or ra["type"] != "plane" or rb["type"] != "plane":
+            continue
+        ang = np.degrees(np.arccos(np.clip(abs(ra["normal"] @ rb["normal"]), -1, 1)))
+        if 1.0 < ang < max_dihedral:
+            pairs.add((min(a, b), max(a, b)))
+    if not pairs:
+        return
+    parent = {}
+
+    def find(i):
+        parent.setdefault(i, i)
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    for a, b in pairs:
+        parent[find(a)] = find(b)
+    groups = {}
+    for i in list(parent):
+        groups.setdefault(find(i), []).append(i)
+    for mem in groups.values():
+        if len(mem) < 3:
+            continue
+        faces = np.concatenate([regions[k]["faces"] for k in mem])
+        pts = tri[faces].reshape(-1, 3)
+        nr = np.repeat(fn[faces], 3, axis=0)
+        cyl = fit_cylinder(pts, nr)
+        if cyl is None or not (2 < cyl["radius"] < 1000) or cyl["rms"] > tol_mm / 2:
+            continue
+        a = cyl["axis"]
+        v = cen[faces] - cyl["point"]
+        v -= np.outer(v @ a, a)
+        e1 = v[0] / np.linalg.norm(v[0])
+        e2 = np.cross(a, e1)
+        ang = np.sort(np.arctan2(v @ e2, v @ e1))
+        gaps = np.diff(np.r_[ang, ang[0] + 2 * np.pi])
+        cover = float(np.degrees(2 * np.pi - gaps.max()))
+        if cover < 60:
+            continue
+        rid = len(regions)
+        t = (cen[faces] - cyl["point"]) @ a
+        regions.append({"type": "cylinder", "axis": a, "point": cyl["point"], "radius": cyl["radius"],
+                        "rms": cyl["rms"], "area": float(area[faces].sum()), "faces": faces,
+                        "length": float(np.ptp(t)), "coverage_deg": cover})
+        labels[faces] = rid
+        for k in mem:
+            regions[k] = None
 
 
 def _merge_coplanar(labels, regions, tri, area, tol_mm, ang_deg=2.0):

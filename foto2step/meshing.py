@@ -161,6 +161,16 @@ def decimate_bounded(mesh, max_err_mm=0.15, max_tris=400000, ref_pts=None):
     if len(best.triangles) > max_tris:
         cand = mesh.simplify_quadric_decimation(max_tris)
         e = err_of(cand)
+        try:  # second, independent decimator (more robust on exactly planar, snapped regions)
+            import fast_simplification
+            v2, f2 = fast_simplification.simplify(np.asarray(mesh.vertices), np.asarray(mesh.triangles),
+                                                  1.0 - max_tris / max(len(mesh.triangles), 1))
+            cand2 = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(v2), o3d.utility.Vector3iVector(f2.astype(np.int32)))
+            e2 = err_of(cand2)
+            if e2 < e:
+                cand, e = cand2, e2
+        except Exception:
+            pass
         if e < 20 * max_err_mm:
             best, best_err = cand, e
             log(f"  WAARSCHUWING: driehoekslimiet {max_tris:,} bereikt, afwijking {best_err:.3f} mm")

@@ -129,7 +129,8 @@ def find_bodies(markers_by_state: dict, state_names: list, thresh: float, sigma:
             else:
                 T[s] = None
         name = "basis" if is_static else f"deel_{len(bodies)}"
-        bodies.append({"name": name, "marker_ids": sorted(int(i) for i in ids), "T": T, "static": is_static})
+        bodies.append({"name": name, "marker_ids": sorted(int(i) for i in ids), "T": T, "static": is_static,
+                       "marker_corners": [np.asarray(mA[i]["corners"]) for i in ids]})
     # merge bodies whose transforms agree in every state where both are known (e.g. split by a missing marker)
     merged = []
     for b in bodies:
@@ -151,6 +152,7 @@ def find_bodies(markers_by_state: dict, state_names: list, thresh: float, sigma:
             merged.append(b)
         else:
             tgt["marker_ids"] = sorted(tgt["marker_ids"] + b["marker_ids"])
+            tgt["marker_corners"] = tgt.get("marker_corners", []) + b.get("marker_corners", [])
             for s in state_names[1:]:
                 if tgt["T"].get(s) is None:
                     tgt["T"][s] = b["T"].get(s)
@@ -203,7 +205,12 @@ def joints_for_bodies(bodies: list, state_names: list) -> list:
             axis /= np.linalg.norm(axis)
             pts = np.array([d["point"] for _, d in rv])
             point = pts.mean(0)
-            point = point - (point @ axis) * axis
+            # report the axis point at the height of the part itself (nearest to its markers)
+            mc = np.vstack([np.asarray(m) for m in b.get("marker_corners", [])]).mean(0) if b.get("marker_corners") else None
+            if mc is not None:
+                point = point + ((mc - point) @ axis) * axis
+            else:
+                point = point - (point @ axis) * axis
             ang = {s: float(d["angle_deg"] * g) for (s, d), g in zip(rv, sgn)}
             ang[state_names[0]] = 0.0
             pitch = float(max(abs(d["pitch_mm"]) for _, d in rv))
