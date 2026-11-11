@@ -1,0 +1,5 @@
+{
+  "python.testing.pytestEnabled": true,
+  "python.testing.pytestArgs": ["tests", "-q"],
+  "files.exclude": { "**/__pycache__": true, "**/work": false }
+}

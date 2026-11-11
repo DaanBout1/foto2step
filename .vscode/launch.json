@@ -1,0 +1,50 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "foto2step: installatiecheck",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "foto2step",
+      "args": ["check"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "foto2step: markers printen (vloer, 120 mm)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "foto2step",
+      "args": ["markers", "--ids", "0-15", "--size", "120", "-o", "markers_vloer.pdf"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "foto2step: run (kies config.yaml)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "foto2step",
+      "args": ["run", "${input:configPath}"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "foto2step: selftest (gauntlet)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "foto2step",
+      "args": ["selftest"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "configPath",
+      "type": "promptString",
+      "description": "Pad naar config.yaml",
+      "default": "machine_01/config.yaml"
+    }
+  ]
+}

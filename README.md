@@ -50,6 +50,20 @@ hoeveel procent "ingevuld" is.
    ```
    Eindigt met `GAUNTLET GESLAAGD` en een lijst PASS/FAIL per controle.
 
+## Draaien in Visual Studio Code
+
+1. Installeer eenmalig de conda-omgeving (zie hierboven) en VS Code met de extensie **Python**.
+2. Open de map `foto2step` in VS Code (File → Open Folder).
+3. `Ctrl+Shift+P` → **Python: Select Interpreter** → kies **foto2step** (de conda-omgeving).
+4. Ga naar **Run and Debug** (`Ctrl+Shift+D`) en kies bovenin:
+   * *foto2step: installatiecheck*
+   * *foto2step: markers printen*
+   * *foto2step: run (kies config.yaml)*: vraagt om het pad naar je `config.yaml`
+   * *foto2step: selftest (gauntlet)*
+5. Druk op **F5**. De voortgang verschijnt in de terminal onderin.
+
+Unit tests: het Testing-paneel (erlenmeyer-icoon) vindt `tests/` vanzelf.
+
 ## Voorbereiden: markers en schaallat
 
 ```
