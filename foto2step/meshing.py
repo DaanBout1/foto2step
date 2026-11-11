@@ -207,37 +207,66 @@ def _max_dev(mesh, ref_pts):
 
 
 def boundary_loops(F):
-    """Boundary loops (vertex index lists, following triangle winding) of a triangle mesh."""
+    """Boundary loops (vertex index lists, oriented along the triangle winding) of a triangle mesh.
+
+    Walks the boundary as an undirected graph (robust to pinch vertices and to small orientation
+    defects from decimation), splits off every closed cycle as soon as a vertex repeats, then orients
+    each loop by majority vote of its directed boundary edges."""
     F = np.asarray(F)
+    if len(F) == 0:
+        return []
     e = np.vstack([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]])
     s = np.sort(e, axis=1)
     _, inv, cnt = np.unique(s, axis=0, return_inverse=True, return_counts=True)
     b = e[cnt[inv.ravel()] == 1]
-    nxt = {}
-    for a, c in b:
-        nxt.setdefault(int(a), []).append(int(c))
+    directed = set(map(tuple, b.tolist()))
+    adj = {}
+    for a_, c_ in b:
+        a_, c_ = int(a_), int(c_)
+        adj.setdefault(a_, []).append(c_)
+        adj.setdefault(c_, []).append(a_)
     used = set()
+
+    def take(u):
+        for w in adj.get(u, []):
+            k = (u, w) if u < w else (w, u)
+            if k not in used:
+                used.add(k)
+                return w
+        return None
+
     loops = []
-    for a0, c0 in b:
-        a0, c0 = int(a0), int(c0)
-        if (a0, c0) in used:
-            continue
-        loop = [a0]
-        a, c = a0, c0
-        ok = True
-        for _ in range(len(b) + 2):
-            used.add((a, c))
-            if c == a0:
+    for start in list(adj):
+        while True:
+            nx = take(start)
+            if nx is None:
                 break
-            loop.append(c)
-            cands = [x for x in nxt.get(c, []) if (c, x) not in used]
-            if not cands:
-                ok = False
-                break
-            a, c = c, cands[0]
-        if ok and len(loop) >= 3:
-            loops.append(loop)
-    return loops
+            path = [start]
+            pos = {start: 0}
+            cur = nx
+            while True:
+                if cur in pos:
+                    k = pos[cur]
+                    cyc = path[k:]
+                    if len(cyc) >= 3:
+                        loops.append(cyc)
+                    for v in path[k + 1:]:
+                        pos.pop(v, None)
+                    path = path[:k + 1]
+                    if cur == start and len(path) == 1:
+                        break
+                else:
+                    pos[cur] = len(path)
+                    path.append(cur)
+                n2 = take(cur)
+                if n2 is None:
+                    break  # dangling chain (should not happen on a clean mesh)
+                cur = n2
+    out = []
+    for lp in loops:
+        fwd = sum((lp[i], lp[(i + 1) % len(lp)]) in directed for i in range(len(lp)))
+        out.append(lp if fwd * 2 >= len(lp) else lp[::-1])
+    return out
 
 
 def _zipper(V, lp, forbidden=frozenset()):
@@ -452,19 +481,26 @@ def _fix_t_junctions(mesh):
     return mesh
 
 
-def close_mesh(mesh, max_radius=3000.0, rounds=5, force=False):
+def close_mesh(mesh, max_radius=3000.0, rounds=6, force=False):
     """Alternate hole filling and manifold repair until the mesh is closed (or no further progress)."""
-    total = left = 0
+    total = 0
+
+    def edges_closed(m):
+        F = np.asarray(m.triangles)
+        if len(F) == 0:
+            return False
+        e = np.sort(np.vstack([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]]), axis=1)
+        _, c = np.unique(e, axis=0, return_counts=True)
+        return bool(np.all(c == 2))
+
     for _ in range(rounds):
         mesh = make_manifold(mesh)
         if not boundary_loops(np.asarray(mesh.triangles)):
             break
         mesh = _fix_t_junctions(mesh)
-        if not boundary_loops(np.asarray(mesh.triangles)):
-            break
         mesh, n, left = fill_holes(mesh, max_radius, zipper_max_mm=(1e9 if force else 60.0))
         total += n
-        if n == 0:
+        if edges_closed(mesh) or n == 0:
             break
-    mesh = make_manifold(mesh)
+    mesh.compute_vertex_normals()
     return mesh, total, len(boundary_loops(np.asarray(mesh.triangles)))
