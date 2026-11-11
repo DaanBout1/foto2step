@@ -84,9 +84,10 @@ def _brep(o: _Out, V: np.ndarray, F: np.ndarray, merge_coplanar=True):
     from .stepexport import _boundary_loops, _coplanar_groups, _is_closed
     V = np.asarray(V, float)
     F = np.asarray(F, np.int64)
+    closed_full = _is_closed(F) if len(F) else False
     tri = V[F]
     ar = np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1)
-    F = F[ar > 1e-10]
+    F = F[ar > 1e-10]  # zero-area slivers have no plane; the gap they leave has zero area
     pts = {}
     vtx = {}
 
@@ -161,7 +162,7 @@ def _brep(o: _Out, V: np.ndarray, F: np.ndarray, merge_coplanar=True):
         bd = o.add(f"FACE_OUTER_BOUND('',#{loop([a, b, c])},.T.)")
         pl = plane(a, n)
         faces.append(o.add(f"ADVANCED_FACE('',(#{bd}),#{pl},.T.)"))
-    closed = _is_closed(F)
+    closed = closed_full
     flist = ",".join(f"#{x}" for x in faces)
     if closed:
         sh = o.add(f"CLOSED_SHELL('',({flist}))")

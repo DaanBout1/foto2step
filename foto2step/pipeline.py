@@ -295,6 +295,7 @@ class Pipeline:
             a0 = dec.get_surface_area()
             dec, nfill, nopen = meshing.close_mesh(dec, float(cm.get("fill_holes_mm", 3000.0)),
                                                    force=bool(self.cfg["export"].get("force_solid", False)))
+            dec = meshing.remove_slivers(dec)
             _FILLED["area"] += max(dec.get_surface_area() - a0, 0.0)
             filled_area = _FILLED["area"]
             if nopen:

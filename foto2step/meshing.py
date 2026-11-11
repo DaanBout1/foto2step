@@ -504,3 +504,65 @@ def close_mesh(mesh, max_radius=3000.0, rounds=6, force=False):
             break
     mesh.compute_vertex_normals()
     return mesh, total, len(boundary_loops(np.asarray(mesh.triangles)))
+
+
+def remove_slivers(mesh, rel=1e-9, rounds=20):
+    """Remove zero-area triangles with three collinear vertices while keeping the mesh closed:
+    the middle vertex m of sliver (a, m, b) is inserted into the neighbour triangle across a-b."""
+    V = np.asarray(mesh.vertices)
+    F = np.asarray(mesh.triangles).copy()
+    for _ in range(rounds):
+        t = V[F]
+        ar = np.linalg.norm(np.cross(t[:, 1] - t[:, 0], t[:, 2] - t[:, 0]), axis=1)
+        L = np.max(np.linalg.norm(t - np.roll(t, 1, axis=1), axis=2), axis=1)
+        bad = np.where(ar <= rel * np.maximum(L * L, 1e-12))[0]
+        if not len(bad):
+            break
+        e = np.vstack([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]])
+        key = {}
+        for idx, (a, b) in enumerate(np.sort(e, 1).tolist()):
+            key.setdefault((a, b), []).append(idx % len(F))
+        kill = set()
+        touched = set()
+        add = []
+        for f in bad:
+            if f in kill:
+                continue
+            tri = F[f]
+            if len(set(tri.tolist())) < 3:
+                continue
+            P = V[tri]
+            d = [np.linalg.norm(P[(i + 1) % 3] - P[(i + 2) % 3]) for i in range(3)]
+            i = int(np.argmax(d))
+            m, a, b = tri[i], tri[(i + 1) % 3], tri[(i + 2) % 3]
+            nb = [g for g in key.get((min(a, b), max(a, b)), []) if g != f]
+            if len(nb) != 1 or nb[0] in kill or nb[0] in touched or f in touched:
+                continue
+            g = nb[0]
+            # the sliver's other edges must not be touched by this round's changes either
+            touched.update([g])
+            tg = F[g].copy()
+            k = [j for j in range(3) if tg[j] not in (a, b)][0]
+            tg = np.roll(tg, -k)
+            x, p, q = tg
+            if x == m:  # two-sided fin (a,m,b)+(b,a,m): both cancel
+                kill.update([f, g])
+                touched.add(g)
+                continue
+            if (min(x, m), max(x, m)) in key:  # edge x-m already exists: split would make it non-manifold
+                continue
+            F[g] = (x, p, m)
+            add.append((x, m, q))
+            kill.add(f)
+            # neighbours of the sliver along a-m and m-b keep their edges: mark them so they are not split now
+            for (u, w) in ((a, m), (m, b)):
+                touched.update(key.get((min(u, w), max(u, w)), []))
+        if not kill:
+            break
+        keep = np.ones(len(F), bool)
+        keep[list(kill)] = False
+        F = np.vstack([F[keep]] + ([np.array(add)] if add else []))
+    out = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(V), o3d.utility.Vector3iVector(F.astype(np.int32)))
+    out.remove_unreferenced_vertices()
+    out.compute_vertex_normals()
+    return out
