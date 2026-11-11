@@ -28,6 +28,12 @@ De STEP bevat een **facetmodel** (vlakke stukjes) waarbij alle vlakke delen van 
 samengevoegd tot echte vlakken. Cilinders/gaten worden herkend en gemeld in het rapport (diameter, as),
 maar zijn in de STEP gefacetteerd. Voor digital twin, botsingscontrole en simulatie is dat prima.
 
+**Solid of schil?** Een onderdeel wordt een gesloten *solid* als het rondom gefotografeerd is. Vlakken die
+nooit zichtbaar waren (onderkant van een arm, het contactvlak waar een slede op het frame ligt) blijven
+standaard open; dan wordt het een *schil* (surface body), want een verzonnen dichting zou niet nauwkeurig zijn.
+Wil je altijd solids (bv. voor massa/botsing), zet dan `export: force_solid: true`; het rapport toont per deel
+hoeveel procent "ingevuld" is.
+
 ## Installatie (Windows, eenmalig)
 
 1. Installeer **Miniforge**: https://github.com/conda-forge/miniforge (Windows x86_64 installer).
@@ -38,7 +44,7 @@ maar zijn in de STEP gefacetteerd. Voor digital twin, botsingscontrole en simula
    python -m foto2step check
    ```
    Dit installeert ook COLMAP en OpenMVS (conda-forge). Met een NVIDIA-kaart gaat alles veel sneller.
-3. Test of alles werkt (gauntlet op een synthetische machine met exact bekende maten, ~1–2 uur op CPU):
+3. Test of alles werkt (gauntlet op een synthetische machine met exact bekende maten; 1–3 uur op CPU, veel sneller met NVIDIA):
    ```
    python -m foto2step selftest
    ```
@@ -123,6 +129,9 @@ Delen handmatig afbakenen (ook met maar 1 stand): `motion: manual_bodies: [{name
 | `mesh.voxel_mm` | detailniveau puntenwolk (standaard 1,0; kleiner = fijner, trager) |
 | `mesh.target_max_error_mm` | max. afwijking door vereenvoudigen van de mesh |
 | `features.*` | vlak/cilinder-herkenning en randen aanscherpen |
+| `mesh.max_triangles` | max. driehoeken per deel in de STEP (standaard 150.000) |
+| `mesh.poisson_max_depth` | 11 (~4 GB RAM); 12 voor fijner detail op grote machines (~12-16 GB RAM) |
+| `export.force_solid` | ook ongeziene openingen dichten zodat elk deel een solid is |
 
 ## Hoe het werkt (kort)
 

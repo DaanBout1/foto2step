@@ -153,9 +153,22 @@ def decimate_bounded(mesh, max_err_mm=0.15, max_tris=400000, ref_pts=None):
         return max(e1, float(np.quantile(dv, 0.999)))
 
     n = len(mesh.triangles)
+    # 1) lossless pass: removes vertices that carry no shape (inside snapped planes) without measurable error
+    try:
+        import pyfqmr
+        s_ = pyfqmr.Simplify()
+        s_.setMesh(np.asarray(mesh.vertices), np.asarray(mesh.triangles))
+        s_.simplify_mesh_lossless(verbose=False, epsilon=min(1e-3, (0.1 * max_err_mm) ** 2), preserve_border=True)
+        v_, f_, _ = s_.getMesh()
+        cand = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(v_), o3d.utility.Vector3iVector(f_.astype(np.int32)))
+        if len(f_) and err_of(cand) <= max_err_mm:
+            log(f"  verliesvrije vereenvoudiging: {n:,} -> {len(f_):,} driehoeken")
+            mesh = cand
+    except Exception as e:
+        log(f"  (verliesvrije vereenvoudiging niet beschikbaar: {e})")
     best = mesh
     best_err = 0.0
-    target = n
+    target = len(mesh.triangles)
     while target > 1000:
         target = int(target * 0.5)
         cand = mesh.simplify_quadric_decimation(target)

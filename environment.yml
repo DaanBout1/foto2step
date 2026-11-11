@@ -20,5 +20,6 @@ dependencies:
       - cadquery-ocp
       - mapbox_earcut
       - fast-simplification
+      - pyfqmr
       - pillow-heif
       - -e .

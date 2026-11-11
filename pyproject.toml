@@ -9,7 +9,7 @@ description = "Telefoonfoto's/video -> geschaalde 3D-reconstructie -> STEP per (
 requires-python = ">=3.10"
 dependencies = [
   "numpy", "scipy", "pyyaml", "pillow", "reportlab",
-  "opencv-contrib-python", "open3d", "trimesh", "pycolmap", "cadquery-ocp", "mapbox_earcut", "fast-simplification", "pillow-heif",
+  "opencv-contrib-python", "open3d", "trimesh", "pycolmap", "cadquery-ocp", "mapbox_earcut", "fast-simplification", "pyfqmr", "pillow-heif",
 ]
 
 [project.scripts]
