@@ -257,7 +257,7 @@ def _existing_edges_among(F, verts):
     return frozenset(map(tuple, e.tolist()))
 
 
-def fill_holes(mesh, max_radius=3000.0, planar_tol=None):
+def fill_holes(mesh, max_radius=3000.0, planar_tol=None, zipper_max_mm=60.0):
     """Close boundary loops: planar loops with constrained ear-clipping, small curved loops with a fan.
 
     Returns (mesh, n_filled, n_left).
@@ -320,6 +320,11 @@ def fill_holes(mesh, max_radius=3000.0, planar_tol=None):
                 continue
         # general fallback: greedy "zipper" ear clipping (shortest diagonal first). Works for thin slits
         # and wiggly or non-planar loops; such caps only close surface that was never observed.
+        # zipper only for small or nearly planar openings; large irregular openings are left open rather
+        # than closed with an inaccurate "tent" (the STEP then becomes a shell)
+        if not (rad <= zipper_max_mm or rms <= max(tol, 0.05 * rad)):
+            left += 1
+            continue
         loop_e = frozenset(tuple(sorted((lp[i], lp[(i + 1) % len(lp)]))) for i in range(len(lp)))
         T = _zipper(V, lp, forbidden - loop_e)
         if T is not None:

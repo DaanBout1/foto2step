@@ -32,6 +32,20 @@ def _dist_to_mesh(pts, mesh_tm):
     return sc.compute_distance(o3d.core.Tensor(np.asarray(pts, np.float32))).numpy()
 
 
+def _step_text_check(path: Path) -> dict:
+    """Light structural check for very large STEP files (full OCC readback needs many GB)."""
+    n_face = n_solid = n_shell = 0
+    with open(path, encoding="ascii") as fh:
+        for line in fh:
+            if "ADVANCED_FACE(" in line:
+                n_face += 1
+            elif "MANIFOLD_SOLID_BREP(" in line:
+                n_solid += 1
+            elif "CLOSED_SHELL(" in line or "OPEN_SHELL(" in line:
+                n_shell += 1
+    return {"faces": n_face, "solids": n_solid, "shells": n_shell}
+
+
 def grade(ds: Path, work: Path, out: Path, T=None, sfm=True) -> dict:
     gt = json.loads((ds / "gt.json").read_text())
     cfg = yaml.safe_load((ds / "config.yaml").read_text())
@@ -123,7 +137,9 @@ def grade(ds: Path, work: Path, out: Path, T=None, sfm=True) -> dict:
         nearest = np.array(names)[np.argmin(D, 1)]
         target = body_map.get(b["name"])
         if target:
-            frac = float(np.mean(nearest == target))
+            srt = np.sort(D, 1)
+            clear = (srt[:, 1] - srt[:, 0]) > 2.0  # ignore contact faces shared by two parts
+            frac = float(np.mean((nearest == target)[clear]))
             check(f"segmentatie {b['name']} -> {target} (oppervlak juist)", frac, 0.97, unit="fractie", higher_better=True)
             d = D[:, names.index(target)]
             # exclude floor-closing faces and contact areas from accuracy (not observable)
@@ -140,7 +156,7 @@ def grade(ds: Path, work: Path, out: Path, T=None, sfm=True) -> dict:
                   unit="fractie", higher_better=True)
     from .stepexport import read_step_check
     for p in parts:
-        rb = p.get("readback") or read_step_check(out / p["step"])
+        rb = p.get("readback") or (read_step_check(out / p["step"]) if p["brep_faces"] <= 60000 else _step_text_check(out / p["step"]))
         ok = rb.get("faces", 0) == p["brep_faces"]
         check(f"STEP {p['name']} teruggelezen ({p['brep_faces']} vlakken)", 0 if ok else 1, 0, unit="")
         check(f"STEP {p['name']} is een solid", 0 if rb.get("solids", 0) >= 1 else 1, 0, unit="")
