@@ -273,3 +273,23 @@ def fill_holes(mesh, max_radius=3000.0, planar_tol=None):
         mesh.remove_degenerate_triangles()
         mesh.compute_vertex_normals()
     return mesh, filled, left
+
+
+def make_manifold(mesh):
+    """Remove non-manifold edges/vertices and slivers so the B-rep is valid (edge shared by exactly <=2 faces)."""
+    for _ in range(3):
+        n0 = len(mesh.triangles)
+        mesh.remove_degenerate_triangles()
+        mesh.remove_duplicated_triangles()
+        mesh.remove_duplicated_vertices()
+        mesh.remove_non_manifold_edges()
+        nm = np.asarray(mesh.get_non_manifold_vertices())
+        if len(nm):
+            F = np.asarray(mesh.triangles)
+            bad = np.isin(F, nm).any(1)
+            mesh.remove_triangles_by_mask(bad)
+        mesh.remove_unreferenced_vertices()
+        if len(mesh.triangles) == n0:
+            break
+    mesh.compute_vertex_normals()
+    return mesh

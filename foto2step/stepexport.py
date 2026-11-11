@@ -97,7 +97,7 @@ def mesh_to_shape(V: np.ndarray, F: np.ndarray, merge_coplanar=True, plane_tol=0
             log(f"  WAARSCHUWING: solid maken mislukt ({e}); schil wordt geschreven")
     nf = _count(shape, TopAbs.TopAbs_FACE)
     valid = BRepCheck.BRepCheck_Analyzer(shape).IsValid()
-    if not valid:
+    if not valid and nf <= 20000:  # ShapeFix on huge facet shells can take hours
         try:
             fx = ShapeFix.ShapeFix_Shape(shape)
             fx.Perform()

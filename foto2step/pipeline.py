@@ -282,6 +282,8 @@ class Pipeline:
             ref_pts = np.asarray(pc.points)
             dec = meshing.decimate_bounded(mesh, max(cm["target_max_error_mm"], noise, 0.05), cm["max_triangles"])
             dec = _fill(dec, hole_mm=float(cm.get("fill_holes_mm", 3000.0)))
+            dec = meshing.make_manifold(dec)
+            dec = meshing.make_manifold(_fill(dec, hole_mm=float(cm.get("fill_holes_mm", 3000.0))))
             # accuracy: measured points -> final surface
             acc = _surface_dev(dec, ref_pts)
             o3d.io.write_triangle_mesh(str(self.work / "bodies" / f"{h:02d}_{name}_final.ply"), dec)
