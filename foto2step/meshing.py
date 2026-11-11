@@ -212,6 +212,41 @@ def boundary_loops(F):
     return loops
 
 
+def _zipper(V, lp, forbidden=frozenset()):
+    """Greedy ear clipping by shortest diagonal; never creates an edge that already exists in the mesh."""
+    lp = list(lp)
+    if len(lp) < 3:
+        return None
+    out = []
+    while len(lp) > 3:
+        a = np.array(lp)
+        prv = np.roll(a, 1)
+        nxt = np.roll(a, -1)
+        d = np.linalg.norm(V[prv] - V[nxt], axis=1)
+        for i in np.argsort(d):
+            e = (min(prv[i], nxt[i]), max(prv[i], nxt[i]))
+            if e not in forbidden:
+                break
+        else:
+            return None
+        out.append((nxt[i], a[i], prv[i]))
+        forbidden = forbidden | {e}
+        lp.pop(int(i))
+    e = (min(lp[0], lp[2]), max(lp[0], lp[2]))
+    out.append((lp[2], lp[1], lp[0]))
+    return np.array(out, np.int64)
+
+
+def _existing_edges_among(F, verts):
+    """Set of existing mesh edges whose both endpoints are in `verts`."""
+    vs = np.zeros(F.max() + 1, bool)
+    vs[np.asarray(list(verts))] = True
+    e = np.vstack([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]])
+    e = e[vs[e[:, 0]] & vs[e[:, 1]]]
+    e.sort(1)
+    return frozenset(map(tuple, e.tolist()))
+
+
 def fill_holes(mesh, max_radius=3000.0, planar_tol=None):
     """Close boundary loops: planar loops with constrained ear-clipping, small curved loops with a fan.
 
@@ -221,6 +256,8 @@ def fill_holes(mesh, max_radius=3000.0, planar_tol=None):
     V = np.asarray(mesh.vertices).copy()
     F = np.asarray(mesh.triangles).copy()
     loops = boundary_loops(F)
+    bverts = set(v for lp in loops for v in lp)
+    forbidden = _existing_edges_among(F, bverts) if bverts else frozenset()
     newF = []
     newV = []
     nV = len(V)
@@ -255,9 +292,14 @@ def fill_holes(mesh, max_radius=3000.0, planar_tol=None):
                 pa = 0.5 * abs(np.sum(uv[:, 0] * np.roll(uv[:, 1], -1) - np.roll(uv[:, 0], -1) * uv[:, 1]))
                 simple = pa > 0 and abs(ta - pa) <= 0.01 * pa
             if simple:
-                # orientation: compare with loop direction
                 lpa = np.array(lp)
                 T = lpa[tri]
+                ne = np.sort(np.vstack([T[:, [0, 1]], T[:, [1, 2]], T[:, [2, 0]]]), axis=1)
+                # boundary edges of the loop itself are allowed; any other existing edge is not
+                loop_e = set(tuple(sorted((lp[i], lp[(i + 1) % len(lp)]))) for i in range(len(lp)))
+                simple = not any((tuple(x) in forbidden) and (tuple(x) not in loop_e) for x in ne.tolist())
+            if simple:
+                # orientation: compare with loop direction
                 nn = np.cross(V[T[:, 1]] - V[T[:, 0]], V[T[:, 2]] - V[T[:, 0]]).sum(0)
                 # loop direction normal (right-hand rule along boundary)
                 ln = np.cross(P - c, np.roll(P, -1, 0) - c).sum(0)
@@ -266,10 +308,11 @@ def fill_holes(mesh, max_radius=3000.0, planar_tol=None):
                 newF.append(T)
                 filled += 1
                 continue
-        if rad <= max(10.0, 0.05 * max_radius):
-            ci = nV + len(newV)
-            newV.append(c)
-            T = np.c_[np.roll(lp, -1), lp, np.full(len(lp), ci)]
+        # general fallback: greedy "zipper" ear clipping (shortest diagonal first). Works for thin slits
+        # and wiggly or non-planar loops; such caps only close surface that was never observed.
+        loop_e = frozenset(tuple(sorted((lp[i], lp[(i + 1) % len(lp)]))) for i in range(len(lp)))
+        T = _zipper(V, lp, forbidden - loop_e)
+        if T is not None:
             newF.append(T)
             filled += 1
         else:
@@ -284,21 +327,111 @@ def fill_holes(mesh, max_radius=3000.0, planar_tol=None):
     return mesh, filled, left
 
 
+def split_nonmanifold_vertices(mesh, nm=None):
+    """Give every edge-connected fan of triangles around a pinch vertex its own copy of that vertex."""
+    V = np.asarray(mesh.vertices).copy()
+    F = np.asarray(mesh.triangles).copy()
+    if nm is None:
+        nm = np.asarray(mesh.get_non_manifold_vertices())
+    newV = []
+    for v in nm:
+        tris = np.where((F == v).any(1))[0]
+        if len(tris) < 2:
+            continue
+        # union-find over triangles sharing an edge that contains v
+        parent = {t: t for t in tris}
+
+        def find(t):
+            while parent[t] != t:
+                parent[t] = parent[parent[t]]
+                t = parent[t]
+            return t
+        other = {t: set(F[t][F[t] != v]) for t in tris}
+        tl = list(tris)
+        for i in range(len(tl)):
+            for j in range(i + 1, len(tl)):
+                if other[tl[i]] & other[tl[j]]:
+                    parent[find(tl[i])] = find(tl[j])
+        fans = {}
+        for t in tris:
+            fans.setdefault(find(t), []).append(t)
+        for k, ts in enumerate(fans.values()):
+            if k == 0:
+                continue
+            ni = len(V) + len(newV)
+            newV.append(V[v])
+            for t in ts:
+                F[t][F[t] == v] = ni
+    if newV:
+        V = np.vstack([V, np.array(newV)])
+        mesh = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(V), o3d.utility.Vector3iVector(F.astype(np.int32)))
+    return mesh
+
+
 def make_manifold(mesh):
     """Remove non-manifold edges/vertices and slivers so the B-rep is valid (edge shared by exactly <=2 faces)."""
     for _ in range(3):
         n0 = len(mesh.triangles)
         mesh.remove_degenerate_triangles()
         mesh.remove_duplicated_triangles()
-        mesh.remove_duplicated_vertices()
         mesh.remove_non_manifold_edges()
         nm = np.asarray(mesh.get_non_manifold_vertices())
         if len(nm):
-            F = np.asarray(mesh.triangles)
-            bad = np.isin(F, nm).any(1)
-            mesh.remove_triangles_by_mask(bad)
+            mesh = split_nonmanifold_vertices(mesh, nm)
         mesh.remove_unreferenced_vertices()
         if len(mesh.triangles) == n0:
             break
     mesh.compute_vertex_normals()
     return mesh
+
+
+def _fix_t_junctions(mesh):
+    """Zero-area 3-vertex holes (vertex m lying on edge a-b): split the triangle across a-b at m."""
+    V = np.asarray(mesh.vertices)
+    F = np.asarray(mesh.triangles).copy()
+    changed = False
+    for lp in boundary_loops(F):
+        if len(lp) != 3:
+            continue
+        P = V[lp]
+        area = 0.5 * np.linalg.norm(np.cross(P[1] - P[0], P[2] - P[0]))
+        L = max(np.linalg.norm(P[1] - P[0]), np.linalg.norm(P[2] - P[1]), np.linalg.norm(P[0] - P[2]))
+        if area > 1e-3 * L * L:
+            continue
+        # the middle vertex m is the one opposite the longest side
+        d = [np.linalg.norm(P[(i + 1) % 3] - P[(i + 2) % 3]) for i in range(3)]
+        i = int(np.argmax(d))
+        m, a, b = lp[i], lp[(i + 1) % 3], lp[(i + 2) % 3]
+        hit = np.where(((F == a).any(1)) & ((F == b).any(1)))[0]
+        if len(hit) != 1:
+            continue
+        t = F[hit[0]].copy()
+        k = [j for j in range(3) if t[j] not in (a, b)][0]
+        x = t[k]
+        # keep winding: rotate so t = (x, p, q)
+        t = np.roll(t, -k)
+        p_, q_ = t[1], t[2]
+        F[hit[0]] = (x, p_, m)
+        F = np.vstack([F, [x, m, q_]])
+        changed = True
+    if changed:
+        mesh = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(V), o3d.utility.Vector3iVector(F.astype(np.int32)))
+    return mesh
+
+
+def close_mesh(mesh, max_radius=3000.0, rounds=5):
+    """Alternate hole filling and manifold repair until the mesh is closed (or no further progress)."""
+    total = left = 0
+    for _ in range(rounds):
+        mesh = make_manifold(mesh)
+        if not boundary_loops(np.asarray(mesh.triangles)):
+            break
+        mesh = _fix_t_junctions(mesh)
+        if not boundary_loops(np.asarray(mesh.triangles)):
+            break
+        mesh, n, left = fill_holes(mesh, max_radius)
+        total += n
+        if n == 0:
+            break
+    mesh = make_manifold(mesh)
+    return mesh, total, len(boundary_loops(np.asarray(mesh.triangles)))

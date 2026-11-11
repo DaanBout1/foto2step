@@ -169,3 +169,23 @@ def test_marker_edge_refinement_unbiased():
         cen = c0.mean(0)
         shrink += list(np.linalg.norm(c0 - cen, axis=1) - np.linalg.norm(e - cen, axis=1))
     assert abs(np.mean(shrink)) < 0.05  # pixels
+
+
+def test_fill_holes_slit_and_wiggly():
+    import open3d as o3d
+    from foto2step.meshing import fill_holes
+    m = trimesh.creation.box(extents=[100, 60, 40])
+    for _ in range(4):
+        m = m.subdivide()
+    c = m.triangles_center
+    # thin slit on a side face + a big irregular hole on the top
+    keep = ~((np.abs(c[:, 1] + 30) < 1e-6) & (np.abs(c[:, 0]) < 30) & (np.abs(c[:, 2]) < 2.5))
+    keep &= ~((c[:, 2] > 19.9) & ((c[:, 0] ** 2 / 40 ** 2 + c[:, 1] ** 2 / 20 ** 2) < 1) & (c[:, 0] < 10 + 5 * np.sin(c[:, 1])))
+    om = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(m.vertices), o3d.utility.Vector3iVector(m.faces[keep]))
+    om.remove_unreferenced_vertices()
+    from foto2step.meshing import close_mesh
+    from foto2step.stepexport import _is_closed
+    out, n, nopen = close_mesh(om, 1000)
+    assert nopen == 0 and _is_closed(np.asarray(out.triangles))
+    t = trimesh.Trimesh(np.asarray(out.vertices), np.asarray(out.triangles), process=False)
+    assert abs(t.volume - 100 * 60 * 40) < 50
