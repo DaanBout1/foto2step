@@ -149,6 +149,9 @@ def grade(ds: Path, work: Path, out: Path, T=None, sfm=True) -> dict:
             # completeness: visible gt surface covered by reconstruction
             gs = gtm[target].sample(40000)
             gs = gs[gs[:, 2] > 5]
+            # exclude contact faces (touching another part): no camera can ever see those
+            others_d = np.min(np.stack([_dist_to_mesh(gs, gtm[n]) for n in gtm if n != target], 1), 1)
+            gs = gs[others_d > 2.0]
             sc = o3d.t.geometry.RaycastingScene()
             sc.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(rm))
             dd = sc.compute_distance(o3d.core.Tensor(gs.astype(np.float32))).numpy()

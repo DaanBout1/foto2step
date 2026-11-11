@@ -145,7 +145,12 @@ def decimate_bounded(mesh, max_err_mm=0.15, max_tris=400000, ref_pts=None):
     def err_of(cand):
         e1 = _max_dev(cand, ref_pts)
         dv = orig.compute_distance(o3d.core.Tensor(np.asarray(cand.vertices, np.float32))).numpy()
-        return max(e1, float(dv.max()) if len(dv) else 0.0)
+        if not len(dv):
+            return e1
+        # robust: 99.9% of vertices within tolerance; a single exploded vertex (QEM failure) is caught by the cap
+        if dv.max() > 20 * max_err_mm:
+            return float(dv.max())
+        return max(e1, float(np.quantile(dv, 0.999)))
 
     n = len(mesh.triangles)
     best = mesh
