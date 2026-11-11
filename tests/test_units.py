@@ -189,3 +189,20 @@ def test_fill_holes_slit_and_wiggly():
     assert nopen == 0 and _is_closed(np.asarray(out.triangles))
     t = trimesh.Trimesh(np.asarray(out.vertices), np.asarray(out.triangles), process=False)
     assert abs(t.volume - 100 * 60 * 40) < 50
+
+
+def test_stepwriter_part_and_assembly(tmp_path):
+    from foto2step.stepexport import read_step_check
+    from foto2step.stepwriter import write_assembly, write_part
+    a = trimesh.creation.box(extents=[100, 50, 30]).subdivide()
+    b = trimesh.creation.icosphere(subdivisions=2, radius=20)
+    b.apply_translation([200, 0, 0])
+    info = write_part(tmp_path / "a.step", "blok", a.vertices, a.faces, (0.5, 0.5, 0.5))
+    assert info["kind"] == "solid" and info["brep_faces"] == 6
+    c = read_step_check(tmp_path / "a.step")
+    assert c["solids"] == 1 and abs(c["volume_mm3"] - 150000) < 1e-3
+    write_assembly(tmp_path / "s.step", "machine", [("blok", a.vertices, a.faces, None), ("bol", b.vertices, b.faces, (0.1, 0.4, 0.8))])
+    c = read_step_check(tmp_path / "s.step")
+    assert c["solids"] == 2 and abs(c["volume_mm3"] - (150000 + b.volume)) < 1e-2
+    txt = (tmp_path / "s.step").read_text()
+    assert "NEXT_ASSEMBLY_USAGE_OCCURRENCE" in txt and "'bol'" in txt

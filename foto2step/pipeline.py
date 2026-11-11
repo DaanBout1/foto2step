@@ -245,7 +245,8 @@ class Pipeline:
 
     def step_parts(self):
         from .features import regularize_mesh
-        from .stepexport import mesh_to_shape, read_step_check, write_step
+        from .stepexport import read_step_check
+        from .stepwriter import write_assembly, write_part
         info = json.loads((self.work / "bodies.json").read_text())
         cm = self.cfg["mesh"]
         noise = info["noise_mm"]
@@ -263,9 +264,7 @@ class Pipeline:
             pj = bdir / f"{h:02d}_{name}_part.json"
             path = pdir / f"{name}.step"
             if pj.exists() and path.exists() and not self.force:
-                from .stepexport import read_step_shape
-                rgb = PART_COLORS[h % len(PART_COLORS)]
-                shapes.append((name, read_step_shape(path), rgb))
+                shapes.append((h, name, PART_COLORS[h % len(PART_COLORS)]))
                 part_info.append(json.loads(pj.read_text()))
                 log(f"[deel {name}] al klaar (hervat)")
                 continue
@@ -289,7 +288,7 @@ class Pipeline:
             if self.cfg["features"].get("enable", True):
                 mesh, feat = regularize_mesh(mesh, noise, self.cfg["features"])
             ref_pts = np.asarray(pc.points)
-            dec = meshing.decimate_bounded(mesh, max(cm["target_max_error_mm"], noise, 0.05), cm["max_triangles"])
+            dec = meshing.decimate_bounded(mesh, max(cm["target_max_error_mm"], 1.5 * noise, 0.05), cm["max_triangles"])
             a0 = dec.get_surface_area()
             dec, nfill, nopen = meshing.close_mesh(dec, float(cm.get("fill_holes_mm", 3000.0)))
             _FILLED["area"] += max(dec.get_surface_area() - a0, 0.0)
@@ -301,13 +300,24 @@ class Pipeline:
             o3d.io.write_triangle_mesh(str(self.work / "bodies" / f"{h:02d}_{name}_final.ply"), dec)
             V = np.asarray(dec.vertices)
             F = np.asarray(dec.triangles)
-            shp, sinfo = mesh_to_shape(V, F, self.cfg["export"].get("merge_coplanar", True))
             rgb = PART_COLORS[h % len(PART_COLORS)]
-            write_step([(name, shp, rgb)], path, name, self.cfg["export"].get("step_schema", "AP214"))
-            chk = read_step_check(path)
-            log(f"  {path.name}: {sinfo['kind']}, {chk['faces']} vlakken (uit {sinfo['triangles']} driehoeken), "
-                f"geldig={sinfo['valid']}, afwijking punten->STEP mediaan {acc['median']:.2f} / 95% {acc['p95']:.2f} mm")
-            shapes.append((name, shp, rgb))
+            merge = self.cfg["export"].get("merge_coplanar", True)
+            sinfo = write_part(path, name, V, F, rgb, merge)
+            tri = V[F]
+            sinfo["volume_mm3"] = float(abs(np.einsum("ij,ij->i", tri[:, 0], np.cross(tri[:, 1], tri[:, 2])).sum()) / 6.0) \
+                if sinfo["kind"] == "solid" else None
+            verify = self.cfg["export"].get("verify_readback", "auto")
+            chk = {}
+            sinfo["valid"] = None
+            if verify is True or (verify == "auto" and sinfo["brep_faces"] <= 60000):
+                chk = read_step_check(path)
+                sinfo["valid"] = bool(chk["faces"] == sinfo["brep_faces"] and
+                                      (chk["solids"] >= 1 if sinfo["kind"] == "solid" else chk["shells"] >= 1))
+            log(f"  {path.name}: {sinfo['kind']}, {sinfo['brep_faces']} vlakken ({sinfo['planar_faces']} samengevoegde vlakken, "
+                f"{sinfo['triangles']} driehoeken), teruggelezen={'ja' if chk else 'overgeslagen'}"
+                + (f" geldig={sinfo['valid']}" if chk else "")
+                + f", afwijking punten->STEP mediaan {acc['median']:.2f} / 95% {acc['p95']:.2f} mm")
+            shapes.append((h, name, rgb))
             filled_frac = filled_area / max(dec.get_surface_area(), 1e-9)
             part_info.append({"name": name, "step": str(path.relative_to(self.out)), **sinfo, "readback": chk,
                               "filled_fraction": float(filled_frac),
@@ -320,7 +330,12 @@ class Pipeline:
         if not shapes:
             raise RuntimeError("Geen enkel onderdeel kon worden opgebouwd (te weinig punten). Zie fotoprotocol.")
         asm = self.out / f"{self.cfg['project']}_samenstelling.step"
-        write_step(shapes, asm, self.cfg["project"], self.cfg["export"].get("step_schema", "AP214"))
+        parts_mesh = []
+        for h, name, rgb in shapes:
+            m = o3d.io.read_triangle_mesh(str(bdir / f"{h:02d}_{name}_final.ply"))
+            parts_mesh.append((name, np.asarray(m.vertices), np.asarray(m.triangles), rgb))
+        write_assembly(asm, self.cfg["project"], parts_mesh, self.cfg["export"].get("merge_coplanar", True))
+        del parts_mesh
         log(f"Samenstelling geschreven: {asm.name} ({len(shapes)} delen)")
         (self.work / "parts.json").write_text(json.dumps(part_info, indent=1, default=_np))
         (self.out / "bewegingen.json").write_text(json.dumps({"joints": info["joints"], "bodies": [

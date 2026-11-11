@@ -137,9 +137,15 @@ def grade(ds: Path, work: Path, out: Path, T=None, sfm=True) -> dict:
             dd = sc.compute_distance(o3d.core.Tensor(gs.astype(np.float32))).numpy()
             check(f"volledigheid {b['name']} (GT-oppervlak binnen 2 mm)", float(np.mean(dd < 2.0)), 0.85,
                   unit="fractie", higher_better=True)
+    from .stepexport import read_step_check
     for p in parts:
-        check(f"STEP {p['name']} geldig + teruggelezen", 0 if (p["valid"] and p["readback"]["faces"] > 0) else 1, 0, unit="")
-        check(f"STEP {p['name']} is een solid", 0 if p["readback"]["solids"] >= 1 else 1, 0, unit="")
+        rb = p.get("readback") or read_step_check(out / p["step"])
+        ok = rb.get("faces", 0) == p["brep_faces"]
+        check(f"STEP {p['name']} teruggelezen ({p['brep_faces']} vlakken)", 0 if ok else 1, 0, unit="")
+        check(f"STEP {p['name']} is een solid", 0 if rb.get("solids", 0) >= 1 else 1, 0, unit="")
+        if p.get("volume_mm3") and rb.get("volume_mm3"):
+            check(f"STEP {p['name']} volume = mesh-volume", abs(rb["volume_mm3"] - p["volume_mm3"]) / p["volume_mm3"], 1e-4,
+                  unit="relatief")
     asm = list(out.glob("*_samenstelling.step"))
     check("samenstelling-STEP aanwezig", 0 if asm else 1, 0, unit="")
     R["passed"] = all(c["pass"] for c in R["checks"])
@@ -164,6 +170,7 @@ def run_selftest(root: Path, quick=False, openmvs_bin="") -> bool:
     c = yaml.safe_load(cfgp.read_text())
     c.setdefault("dense", {})
     c["dense"]["backend"] = "auto"
+    c.setdefault("export", {})["verify_readback"] = True
     if openmvs_bin:
         c["dense"]["openmvs_bin"] = openmvs_bin
     cfgp.write_text(yaml.safe_dump(c, sort_keys=False))

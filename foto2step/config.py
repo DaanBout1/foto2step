@@ -51,7 +51,7 @@ DEFAULTS = {
         "floor_clearance_mm": 3.0,
         "floor_snap_mm": 40.0,    # open onderrand lager dan dit -> doorgetrokken tot de vloer
         "target_max_error_mm": 0.15,  # decimatie mag max zoveel afwijken
-        "max_triangles": 400000,
+        "max_triangles": 150000,  # per onderdeel in de STEP (geheugen/bestandsgrootte)
         "fill_holes_mm": 3000.0,
         "working_triangles": 1200000,  # max. driehoeken per mesh tijdens verwerking (geheugen)  # gaten tot deze straal dichten (nodig voor solids)
     },
@@ -71,6 +71,7 @@ DEFAULTS = {
     },
     "export": {
         "step_schema": "AP214",
+        "verify_readback": "auto",  # STEP teruglezen met OpenCASCADE ter controle (auto: tot 60k vlakken)
         "merge_coplanar": True,
         "urdf": True,
     },
