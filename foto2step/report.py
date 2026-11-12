@@ -73,6 +73,20 @@ def write_report(work: Path, out: Path, cfg: dict, states: list):
       + (f"{_r(chk)} mm" if chk is not None else "<span class='warn'>geen</span>") + "</div></div></div>")
     if chk is None:
         a("<p class='note warn'>Geen controlematen opgegeven: zet 'check_distances' in de config voor een onafhankelijke toets.</p>")
+    # capture device(s): warnings first (e.g. iPhone Air -> lower accuracy)
+    dev_rows, dev_warn, dev_adv = [], [], []
+    for s_ in states:
+        fi = work / s_ / "images_info.json"
+        if not fi.exists():
+            continue
+        inf = json.loads(fi.read_text())
+        dv = inf.get("device") or {}
+        dev_warn += [w for w in dv.get("warnings", []) if w not in dev_warn]
+        dev_adv += [x for x in dv.get("advice", []) if x not in dev_adv]
+        for g, gi in (inf.get("groups") or {}).items():
+            dev_rows.append((s_, g, gi))
+    for w in dev_warn:
+        a(f"<div class='card' style='border-color:#e9c46a;background:#fff8e6;margin:10px 0'><b class='warn'>Let op:</b> {html.escape(w)}</div>")
     a("<p class='note'>De nauwkeurigheid geldt voor oppervlakken die goed op de foto's stonden. Ingevulde gaten, blinde hoeken en "
       "glimmende/zwarte vlakken kunnen meer afwijken (zie kolom 'Ingevuld').</p>")
     try:
@@ -84,6 +98,16 @@ def write_report(work: Path, out: Path, cfg: dict, states: list):
             a(f"<h2>Resultaat</h2><img class='preview' src='{img}' alt='voorbeeld'>")
     except Exception as e:  # preview is optional
         a(f"<p class='note'>(voorbeeldafbeelding niet beschikbaar: {html.escape(str(e))})</p>")
+    if dev_rows:
+        from .device import LENS_NL
+        a("<h2>Opname</h2><div class='panel'><table><tr><th>Stand</th><th>Toestel</th><th>Lens</th><th>Foto's</th>"
+          "<th>Formaat</th><th>Eigen kalibratie</th></tr>")
+        for s_, g, gi in dev_rows:
+            a(f"<tr><td>{s_}</td><td>{html.escape(str(gi.get('model') or 'onbekend'))}</td>"
+              f"<td>{html.escape(LENS_NL.get(gi.get('lens_class'), gi.get('lens_class') or ''))}"
+              f"{' · ' + str(int(gi['focal_35mm'])) + ' mm' if gi.get('focal_35mm') else ''}</td><td>{gi.get('count')}</td>"
+              f"<td>{'ProRAW (DNG)' if gi.get('raw') else 'JPEG/HEIC'}</td><td>{html.escape(g)}</td></tr>")
+        a("</table></div>")
     # per state
     a("<h2>Per stand</h2><div class='panel'><table><tr><th>Stand</th><th>Beelden</th><th>Reproj. fout</th><th>Markers</th>"
       "<th>Schaal-onzekerheid</th><th>Hoekpunt-precisie</th><th>Vloervlak RMS</th><th>Ruis</th></tr>")
@@ -144,7 +168,7 @@ def write_report(work: Path, out: Path, cfg: dict, states: list):
             a(f"<tr><td>{html.escape(j['body'])}</td><td>{j['type']}</td><td>{ax}</td><td>{st}</td></tr>")
         a("</table></div>")
     # advice
-    adv = []
+    adv = list(dev_adv)
     cal0 = json.loads((work / states[0] / "calibration.json").read_text())
     if not cal0["scale"].get("bars"):
         adv.append("Gebruik een schaallat (2 markers op een stijve aluminium lat, hart-hart gemeten). Dat verbetert de schaal sterk.")

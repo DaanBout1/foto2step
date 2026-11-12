@@ -51,7 +51,7 @@ class Pipeline:
                 continue
             info = json.loads((d / "images_info.json").read_text())
             log(f"[{s}] Structure-from-Motion")
-            run_sfm(d / "images", d, self.cfg["sfm"], info.get("focal_px_prior"))
+            run_sfm(d / "images", d, self.cfg["sfm"], info.get("focal_px_prior"), info.get("groups"))
 
     def step_calibrate(self):
         from .scale import calibrate_state

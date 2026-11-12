@@ -22,4 +22,6 @@ dependencies:
       - fast-simplification
       - pyfqmr
       - pillow-heif
+      - rawpy
+      - exifread
       - -e .

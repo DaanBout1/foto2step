@@ -16,8 +16,11 @@ def _pycolmap():
     return pycolmap
 
 
-def run_sfm(image_dir: Path, work: Path, cfg_sfm: dict, focal_prior: float | None = None):
-    """Run SfM, return path to best sparse model directory."""
+def run_sfm(image_dir: Path, work: Path, cfg_sfm: dict, focal_prior: float | None = None, groups: dict | None = None):
+    """Run SfM, return path to best sparse model directory.
+
+    groups: {subfolder: {"focal_px_prior": ...}}; with more than one lens group every subfolder gets its
+    own camera calibration (PER_FOLDER)."""
     work.mkdir(parents=True, exist_ok=True)
     db = work / "database.db"
     if db.exists():
@@ -26,7 +29,8 @@ def run_sfm(image_dir: Path, work: Path, cfg_sfm: dict, focal_prior: float | Non
     if sparse.exists():
         shutil.rmtree(sparse)
     sparse.mkdir()
-    n_img = len([p for p in image_dir.iterdir() if p.is_file()])
+    n_img = len([p for p in image_dir.rglob("*") if p.is_file()])
+    multi = bool(groups) and len(groups) > 1
     matcher = cfg_sfm.get("matcher", "exhaustive")
     if matcher == "exhaustive" and n_img > 400:
         log(f"  {n_img} beelden: overschakelen op sequential matching")
@@ -35,9 +39,9 @@ def run_sfm(image_dir: Path, work: Path, cfg_sfm: dict, focal_prior: float | Non
     if backend == "auto":
         backend = "pycolmap"
     if backend == "colmap_cli":
-        _run_cli(image_dir, db, sparse, cfg_sfm, matcher, focal_prior)
+        _run_cli(image_dir, db, sparse, cfg_sfm, matcher, None if multi else focal_prior, multi, groups)
     else:
-        _run_pycolmap(image_dir, db, sparse, cfg_sfm, matcher, focal_prior)
+        _run_pycolmap(image_dir, db, sparse, cfg_sfm, matcher, None if multi else focal_prior, multi, groups)
     return _select_best(sparse, work / "sparse", n_img)
 
 
@@ -45,7 +49,7 @@ def _camera_params(cfg_sfm, focal_prior, image_dir):
     if not focal_prior:
         return ""
     import cv2
-    first = sorted(p for p in image_dir.iterdir() if p.is_file())[0]
+    first = sorted(p for p in image_dir.rglob("*") if p.is_file())[0]
     h, w = cv2.imread(str(first), cv2.IMREAD_GRAYSCALE).shape
     model = cfg_sfm.get("camera_model", "OPENCV")
     if model == "OPENCV":
@@ -57,7 +61,44 @@ def _camera_params(cfg_sfm, focal_prior, image_dir):
     return ""
 
 
-def _run_pycolmap(image_dir, db, sparse, cfg_sfm, matcher, focal_prior):
+def _set_group_priors(db, groups):
+    """Write per-lens focal priors into the COLMAP database (one camera per subfolder)."""
+    import pycolmap
+    if not groups:
+        return
+    try:
+        d = pycolmap.Database(str(db)) if not hasattr(pycolmap.Database, "open") else pycolmap.Database.open(str(db))
+    except Exception:
+        try:
+            d = pycolmap.Database()
+            d.open(str(db))
+        except Exception as e:
+            log(f"  (lens-startwaarden niet gezet: {e})")
+            return
+    try:
+        cam_group = {}
+        for im in d.read_all_images():
+            cam_group.setdefault(im.camera_id, im.name.split("/")[0])
+        for cid, g in cam_group.items():
+            fp = (groups.get(g) or {}).get("focal_px_prior")
+            if not fp:
+                continue
+            cam = d.read_camera(cid)
+            p = list(cam.params)
+            for i in cam.focal_length_idxs():
+                p[i] = fp
+            cam.params = p
+            cam.has_prior_focal_length = True
+            d.update_camera(cam)
+        log(f"  {len(cam_group)} lensgroepen, elk met eigen kalibratie")
+    finally:
+        try:
+            d.close()
+        except Exception:
+            pass
+
+
+def _run_pycolmap(image_dir, db, sparse, cfg_sfm, matcher, focal_prior, multi=False, groups=None):
     pycolmap = _pycolmap()
     log("  SfM (pycolmap): features extraheren")
     reader = pycolmap.ImageReaderOptions()
@@ -73,8 +114,13 @@ def _run_pycolmap(image_dir, db, sparse, cfg_sfm, matcher, focal_prior):
     if not gpu:
         ext.sift.estimate_affine_shape = True
         ext.sift.domain_size_pooling = True
-    mode = pycolmap.CameraMode.SINGLE if cfg_sfm.get("single_camera", True) else pycolmap.CameraMode.AUTO
+    if multi:
+        mode = pycolmap.CameraMode.PER_FOLDER
+    else:
+        mode = pycolmap.CameraMode.SINGLE if cfg_sfm.get("single_camera", True) else pycolmap.CameraMode.AUTO
     pycolmap.extract_features(db, image_dir, camera_mode=mode, reader_options=reader, extraction_options=ext)
+    if multi:
+        _set_group_priors(db, groups)
     log(f"  SfM: matching ({matcher})")
     mo = pycolmap.FeatureMatchingOptions()
     mo.use_gpu = gpu
@@ -101,14 +147,15 @@ def _cli_help(bin_, cmd):
         return ""
 
 
-def _run_cli(image_dir, db, sparse, cfg_sfm, matcher, focal_prior):
+def _run_cli(image_dir, db, sparse, cfg_sfm, matcher, focal_prior, multi=False, groups=None):
     b = cfg_sfm.get("colmap_bin", "colmap")
     h = _cli_help(b, "feature_extractor")
     gpu = "1" if cfg_sfm.get("use_gpu", True) else "0"
     ext_prefix = "FeatureExtraction" if "FeatureExtraction.use_gpu" in h else "SiftExtraction"
     cmd = [b, "feature_extractor", "--database_path", str(db), "--image_path", str(image_dir),
            "--ImageReader.camera_model", cfg_sfm.get("camera_model", "OPENCV"),
-           "--ImageReader.single_camera", "1" if cfg_sfm.get("single_camera", True) else "0",
+           "--ImageReader.single_camera", "0" if multi else ("1" if cfg_sfm.get("single_camera", True) else "0"),
+           "--ImageReader.single_camera_per_folder", "1" if multi else "0",
            "--SiftExtraction.max_num_features", str(int(cfg_sfm.get("max_features", 16384))),
            f"--{ext_prefix}.use_gpu", gpu, f"--{ext_prefix}.max_image_size", "10000"]
     cp = _camera_params(cfg_sfm, focal_prior, image_dir)
@@ -117,6 +164,8 @@ def _run_cli(image_dir, db, sparse, cfg_sfm, matcher, focal_prior):
     if gpu == "0":
         cmd += ["--SiftExtraction.estimate_affine_shape", "1", "--SiftExtraction.domain_size_pooling", "1"]
     _sh(cmd)
+    if multi:
+        _set_group_priors(db, groups)
     hm = _cli_help(b, "exhaustive_matcher")
     mprefix = "FeatureMatching" if "FeatureMatching.use_gpu" in hm else "SiftMatching"
     if matcher == "sequential":

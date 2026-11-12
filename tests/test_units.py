@@ -219,3 +219,23 @@ def test_cylinder_from_plane_strips():
     cyl = [r for r in rep["regions"] if r["type"] == "cylinder"]
     assert len(cyl) >= 1
     assert abs(max(cyl, key=lambda r: r["area"])["radius"] - 30) < 0.1
+
+
+def test_device_profiles_and_advice():
+    from foto2step.device import assess, group_key, lens_class, phone_tier
+    assert phone_tier("iPhone Air") == "air"
+    assert phone_tier("iPhone 18 Pro Max") == "pro_var_aperture"
+    assert phone_tier("iPhone 19 Pro") == "pro_var_aperture"
+    assert phone_tier("iPhone 16 Pro") == "pro"
+    assert lens_class({"focal_35mm": 13}) == "ultra"
+    assert lens_class({"focal_35mm": 24}) == "main"
+    assert lens_class({"focal_35mm": 48}) == "main2x"
+    assert lens_class({"focal_35mm": 100}) == "tele"
+    assert group_key({"focal_35mm": 24, "raw": True}, (6048, 8064)) == "main_raw_49mp"
+    air = assess([{"model": "iPhone Air", "f_number": 1.6, "exposure_s": 1 / 60, "iso": 200, "raw": False}] * 10)
+    assert any("iPhone Air" in w and "lagere nauwkeurigheid" in w for w in air["warnings"])
+    pro = assess([{"model": "iPhone 18 Pro Max", "f_number": 1.48, "exposure_s": 1 / 500, "iso": 400, "raw": False}] * 10)
+    assert not pro["warnings"]
+    assert any("ƒ/4.0" in a for a in pro["advice"]) and any("ProRAW" in a for a in pro["advice"])
+    good = assess([{"model": "iPhone 18 Pro Max", "f_number": 4.0, "exposure_s": 1 / 500, "iso": 400, "raw": True}] * 10)
+    assert not good["warnings"] and not good["advice"]
