@@ -84,10 +84,30 @@ python -m foto2step markers --ids 200-231 --size 40 -o delen.pdf     # bewegende
 * **Vast frame**: een paar markers op het machineframe.
 * **Elk bewegend deel**: minstens **2 markers** (liefst 3, ver uit elkaar, op verschillende vlakken). Zo herkent het programma welk deel beweegt en hoe.
 
+## iPhone: welke telefoon, welke instellingen
+
+foto2step leest uit elke foto welk toestel en welke lens is gebruikt. Elke lens (en elke uitsnede, zoals "2x")
+krijgt automatisch **een eigen lenskalibratie**: je mag dus een overzichtsserie met de hoofdcamera combineren
+met een detailserie met de telelens. Het rapport toont per lensgroep wat er is gebruikt.
+
+| | iPhone 18 Pro / Pro Max | iPhone Air |
+|---|---|---|
+| Werkt | ja, **beste resultaat** | ja, **lagere nauwkeurigheid** (melding in log en rapport) |
+| Diafragma | zet **ƒ/4.0** (Pro-bediening): veel meer scherptediepte | vast ƒ/1.6: fotografeer iets verder weg |
+| Formaat | **ProRAW (DNG), 48MP**: wordt direct ingelezen | HEIC of JPEG, 48MP |
+| Sluitertijd | **≤ 1/250 s** handmatig | niet instelbaar: zorg voor veel licht |
+| Detailserie | telelens 4x als aparte serie (min. 8 foto's) | n.v.t. |
+| LiDAR | niet nodig: zit niet in gewone foto's | n.v.t. |
+
+Het programma controleert diafragma, sluitertijd, ISO en RAW, en geeft concreet advies als het beter kan.
+Staat dezelfde foto er als DNG én als JPEG/HEIC, dan wordt de DNG gebruikt. Een lensgroep met minder dan
+8 foto's wordt overgeslagen (te weinig voor een eigen kalibratie).
+
 ## Fotoprotocol (bepaalt 90% van het resultaat)
 
 **Telefooninstellingen**
-* Hoofdcamera, **1× zoom, nooit wisselen** van lens (iPhone: "Macrobediening" uit; Android: Pro-modus).
+* Per fotoserie **één lens en één zoomstand**. Wil je een detailserie met een andere lens, maak die dan als
+  aparte, complete serie (min. 8 foto's met overlap). iPhone Pro: "Macrobediening" uit, anders wisselt hij zelf van lens.
 * **Focus en belichting vastzetten** (lang tikken → AE/AF-vergrendeling). Geen HDR/portret/nachtmodus.
 * Hoogste resolutie, geen flits. JPG en HEIC (iPhone) werken allebei. Staand en liggend mag door elkaar:
   het programma draait alles terug naar de sensororiëntatie, zodat één lenskalibratie voor alle foto's geldt.
