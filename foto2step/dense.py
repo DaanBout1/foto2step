@@ -12,13 +12,53 @@ import open3d as o3d
 from .log import log
 
 
-def _which(name, folder=""):
+def _conda_roots():
+    env = os.environ
+    roots = []
+    for base in (env.get("USERPROFILE"), env.get("LOCALAPPDATA"), env.get("ProgramData"), env.get("HOME"),
+                 str(Path.home())):
+        if not base:
+            continue
+        for d in ("miniforge3", "Miniforge3", "mambaforge", "miniconda3", "Miniconda3", "anaconda3", "Anaconda3"):
+            roots.append(Path(base) / d)
+    if env.get("CONDA_PREFIX"):
+        roots.append(Path(env["CONDA_PREFIX"]))
+    return [r for r in dict.fromkeys(roots) if r.exists()]
+
+
+_FOUND = {}
+
+
+def find_tool(name, folder=""):
+    """Locate an executable: configured folder, PATH, then Miniforge/conda environments (recursive)."""
     if folder:
         for ext in ("", ".exe"):
             p = Path(folder) / (name + ext)
             if p.exists():
                 return str(p)
-    return shutil.which(name)
+    w = shutil.which(name)
+    if w:
+        return w
+    if name in _FOUND:
+        return _FOUND[name]
+    for root in _conda_roots():
+        for pattern in (f"envs/*/Library/bin/{name}.exe", f"envs/*/Library/bin/*/{name}.exe", f"envs/*/bin/{name}",
+                        f"envs/*/bin/OpenMVS/{name}", f"Library/bin/{name}.exe", f"bin/{name}"):
+            hits = sorted(root.glob(pattern))
+            if hits:
+                _FOUND[name] = str(hits[0])
+                return _FOUND[name]
+    for root in _conda_roots():  # last resort: full recursive search
+        hits = list((root / "envs").rglob(f"{name}.exe")) if (root / "envs").exists() else []
+        if hits:
+            _FOUND[name] = str(hits[0])
+            return _FOUND[name]
+    _FOUND[name] = None
+    return None
+
+
+def _which(name, folder=""):
+    return find_tool(name, folder)
 
 
 def _sh(cmd, cwd=None):

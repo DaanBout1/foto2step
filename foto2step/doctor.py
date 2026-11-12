@@ -33,8 +33,12 @@ def doctor() -> bool:
     col = shutil.which("colmap")
     line("colmap CLI", bool(col), col or "(optioneel)")
     cuda = colmap_cuda_available()
-    mvs = shutil.which("DensifyPointCloud")
+    from .dense import _conda_roots, find_tool
+    mvs = find_tool("DensifyPointCloud")
     line("OpenMVS DensifyPointCloud", bool(mvs), mvs or "")
+    if not mvs:
+        roots = _conda_roots()
+        print("     gezocht in PATH en: " + (", ".join(str(r) for r in roots) if roots else "(geen Miniforge/conda-map gevonden)"))
     if not (cuda or mvs):
         print("  !! Geen dense-backend: installeer OpenMVS (conda-forge) of COLMAP met CUDA. Zie README.")
         ok = False
