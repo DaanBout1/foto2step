@@ -239,3 +239,20 @@ def test_device_profiles_and_advice():
     assert any("ƒ/4.0" in a for a in pro["advice"]) and any("ProRAW" in a for a in pro["advice"])
     good = assess([{"model": "iPhone 18 Pro Max", "f_number": 4.0, "exposure_s": 1 / 500, "iso": 400, "raw": True}] * 10)
     assert not good["warnings"] and not good["advice"]
+
+
+def test_isolate_objects_drops_floor_clutter():
+    import open3d as o3d
+    from foto2step.meshing import isolate_objects
+    rng = np.random.default_rng(0)
+    # 80 mm cube standing on the floor (surface samples) + a curled sheet of paper 300 mm away (z 3..8 mm)
+    g = np.stack(np.meshgrid(np.arange(0, 80, 1.0), np.arange(0, 80, 1.0)), -1).reshape(-1, 2)
+    faces = [np.c_[g, np.full(len(g), 80.0)], np.c_[g[:, 0], np.zeros(len(g)), g[:, 1]],
+             np.c_[g[:, 0], np.full(len(g), 80.0), g[:, 1]], np.c_[np.zeros(len(g)), g]]
+    cube = np.vstack(faces)
+    cube = cube[cube[:, 2] > 3]
+    paper = np.c_[rng.uniform(300, 510, 6000), rng.uniform(0, 297, 6000), rng.uniform(3, 8, 6000)]
+    pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(np.vstack([cube, paper])))
+    out = np.asarray(isolate_objects(pc, {"voxel_mm": 1.0}).points)
+    assert len(out) == len(cube)
+    assert out[:, 0].max() < 100

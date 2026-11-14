@@ -94,6 +94,7 @@ class Pipeline:
             mk = json.loads((d / "markers_world.json").read_text())
             pc = meshing.crop_cloud(pc, mk, cm)
             pc = meshing.clean_cloud(pc, cm["voxel_mm"])
+            pc = meshing.isolate_objects(pc, cm)
             noise = meshing.noise_estimate(pc)
             log(f"  oppervlakteruis ~{noise:.3f} mm (RMS)")
             o3d.io.write_point_cloud(str(d / "cloud_clean.ply"), pc)

@@ -34,6 +34,38 @@ def clean_cloud(pc, voxel):
     return pc
 
 
+def isolate_objects(pc, cfg_mesh):
+    """Drop floor clutter: connected clusters that never rise above min_object_height_mm (curled marker
+    paper, floor-texture noise, cables) or that are tiny compared to the largest object. Real objects
+    standing on the floor are kept, also when they are not connected to each other."""
+    if not cfg_mesh.get("isolate_objects", True):
+        return pc
+    pts = np.asarray(pc.points)
+    if len(pts) < 1000:
+        return pc
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+    r = 4.0 * float(cfg_mesh.get("voxel_mm", 1.0))
+    pairs = cKDTree(pts).query_pairs(r, output_type="ndarray")
+    if len(pairs) == 0:
+        return pc
+    n = len(pts)
+    _, lab = connected_components(coo_matrix((np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])), shape=(n, n)),
+                                  directed=False)
+    cnt = np.bincount(lab)
+    zmax = np.full(len(cnt), -np.inf)
+    np.maximum.at(zmax, lab, pts[:, 2])
+    h_min = float(cfg_mesh.get("min_object_height_mm", 10.0))
+    f_min = float(cfg_mesh.get("min_object_fraction", 0.02))
+    good = (zmax >= h_min) & (cnt >= f_min * cnt.max())
+    if not good.any():
+        return pc
+    keep = good[lab]
+    log(f"  objecten geisoleerd: {int(good.sum())} van {len(cnt)} clusters behouden "
+        f"({int((~keep).sum()):,} punten vloerruis/papier/los spul verwijderd)")
+    return pc.select_by_index(np.where(keep)[0])
+
+
 def noise_estimate(pc, k=16, sample=20000):
     """Robust local surface noise (mm): RMS distance to local plane over k-NN, median over sample."""
     pts = np.asarray(pc.points)

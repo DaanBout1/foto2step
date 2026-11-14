@@ -49,6 +49,9 @@ DEFAULTS = {
         "crop_margin_mm": 300.0,  # marge rond markers/object
         "remove_floor": True,     # vloer-markers definieren vloervlak; vloer wordt verwijderd
         "floor_clearance_mm": 3.0,
+        "isolate_objects": True,  # losse vloerruis (krullend papier, kabels, stof) weggooien
+        "min_object_height_mm": 10.0,  # cluster moet minstens zo hoog boven de vloer komen
+        "min_object_fraction": 0.02,   # en minstens 2% van de punten van het grootste object hebben
         "floor_snap_mm": 40.0,    # open onderrand lager dan dit -> doorgetrokken tot de vloer
         "target_max_error_mm": 0.15,  # decimatie mag max zoveel afwijken
         "max_triangles": 150000,  # per onderdeel in de STEP (geheugen/bestandsgrootte)
