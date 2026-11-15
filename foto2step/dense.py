@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import open3d as o3d
 
+from .compute import n_threads
 from .log import log
 
 
@@ -158,6 +159,8 @@ def _dense_openmvs(dense_dir, out_ply, cfg):
            "--resolution-level", str(lvl), "--max-resolution", str(int(cfg["dense"].get("max_resolution", 4096))),
            "--number-views-fuse", str(int(cfg["dense"].get("number_views_fuse", 3))),
            "--estimate-normals", "2"]
+    if n_threads() > 0:
+        cmd += ["--max-threads", str(n_threads())]
     _sh(cmd)
     ply = dense_dir / "scene_dense.ply"
     if not ply.exists():

@@ -68,8 +68,12 @@ def main(argv=None):
         print(f"Project aangemaakt in {d}. Pas {cfgp} aan en zet foto's/video's in fotos/stand_A (en _B ...).")
     elif a.cmd == "run":
         from .config import load_config
-        from .pipeline import Pipeline
         cfg = load_config(a.config)
+        from .compute import configure
+        n = configure(cfg)  # before numpy/open3d/pycolmap are imported
+        from .pipeline import Pipeline
+        from .log import log
+        log(f"CPU: {n} van {__import__('os').cpu_count()} kernen in gebruik (compute.max_threads)")
         root = Path(a.config).resolve().parent
         work = Path(a.work) if a.work else root / "work"
         out = Path(a.out) if a.out else root / "output"

@@ -8,6 +8,10 @@ import yaml
 
 DEFAULTS = {
     "project": "machine",
+    # Rekenkracht: minder threads = trager maar koeler (laptops!). Nauwkeurigheid verandert niet.
+    "compute": {
+        "max_threads": 0,         # 0 = automatisch: de helft van de CPU-kernen
+    },
     # Alle maten in mm.
     "markers": {
         "dictionary": "DICT_5X5_250",

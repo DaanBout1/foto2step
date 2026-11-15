@@ -166,6 +166,7 @@ Delen handmatig afbakenen (ook met maar 1 stand): `motion: manual_bodies: [{name
 | `mesh.max_triangles` | max. driehoeken per deel in de STEP (standaard 150.000) |
 | `mesh.poisson_max_depth` | 11 (~4 GB RAM); 12 voor fijner detail op grote machines (~12-16 GB RAM) |
 | `export.force_solid` | ook ongeziene openingen dichten zodat elk deel een solid is |
+| `compute.max_threads` | aantal CPU-threads (0 = helft van de kernen). Laptop wordt te heet of valt uit? Zet op 2-4: trager, zelfde nauwkeurigheid |
 
 ## Hoe het werkt (kort)
 

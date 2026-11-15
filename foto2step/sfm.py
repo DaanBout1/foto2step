@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .compute import n_threads
 from .log import log
 
 
@@ -109,6 +110,7 @@ def _run_pycolmap(image_dir, db, sparse, cfg_sfm, matcher, focal_prior, multi=Fa
     ext = pycolmap.FeatureExtractionOptions()
     ext.sift.max_num_features = int(cfg_sfm.get("max_features", 16384))
     ext.max_image_size = 10000  # volle resolutie
+    ext.num_threads = n_threads()
     gpu = bool(cfg_sfm.get("use_gpu", True)) and pycolmap.has_cuda
     ext.use_gpu = gpu
     if not gpu:
@@ -124,6 +126,7 @@ def _run_pycolmap(image_dir, db, sparse, cfg_sfm, matcher, focal_prior, multi=Fa
     log(f"  SfM: matching ({matcher})")
     mo = pycolmap.FeatureMatchingOptions()
     mo.use_gpu = gpu
+    mo.num_threads = n_threads()
     g = cfg_sfm.get("guided_matching", "auto")
     mo.guided_matching = gpu if g == "auto" else bool(g)  # ~10x trager op CPU, kleine winst
     if matcher == "sequential":
@@ -137,6 +140,7 @@ def _run_pycolmap(image_dir, db, sparse, cfg_sfm, matcher, focal_prior, multi=Fa
     opts = pycolmap.IncrementalPipelineOptions()
     opts.ba_refine_principal_point = False
     opts.multiple_models = True
+    opts.num_threads = n_threads()
     pycolmap.incremental_mapping(db, image_dir, sparse, options=opts)
 
 
@@ -157,7 +161,8 @@ def _run_cli(image_dir, db, sparse, cfg_sfm, matcher, focal_prior, multi=False, 
            "--ImageReader.single_camera", "0" if multi else ("1" if cfg_sfm.get("single_camera", True) else "0"),
            "--ImageReader.single_camera_per_folder", "1" if multi else "0",
            "--SiftExtraction.max_num_features", str(int(cfg_sfm.get("max_features", 16384))),
-           f"--{ext_prefix}.use_gpu", gpu, f"--{ext_prefix}.max_image_size", "10000"]
+           f"--{ext_prefix}.use_gpu", gpu, f"--{ext_prefix}.max_image_size", "10000",
+           f"--{ext_prefix}.num_threads", str(n_threads())]
     cp = _camera_params(cfg_sfm, focal_prior, image_dir)
     if cp:
         cmd += ["--ImageReader.camera_params", cp]
@@ -170,11 +175,13 @@ def _run_cli(image_dir, db, sparse, cfg_sfm, matcher, focal_prior, multi=False, 
     mprefix = "FeatureMatching" if "FeatureMatching.use_gpu" in hm else "SiftMatching"
     if matcher == "sequential":
         _sh([b, "sequential_matcher", "--database_path", str(db), f"--{mprefix}.use_gpu", gpu,
-             "--SequentialMatching.overlap", "30", f"--{mprefix}.guided_matching", _guided(cfg_sfm, gpu)])
+             "--SequentialMatching.overlap", "30", f"--{mprefix}.guided_matching", _guided(cfg_sfm, gpu),
+             f"--{mprefix}.num_threads", str(n_threads())])
     else:
         _sh([b, "exhaustive_matcher", "--database_path", str(db), f"--{mprefix}.use_gpu", gpu,
-             f"--{mprefix}.guided_matching", _guided(cfg_sfm, gpu)])
-    _sh([b, "mapper", "--database_path", str(db), "--image_path", str(image_dir), "--output_path", str(sparse)])
+             f"--{mprefix}.guided_matching", _guided(cfg_sfm, gpu), f"--{mprefix}.num_threads", str(n_threads())])
+    _sh([b, "mapper", "--database_path", str(db), "--image_path", str(image_dir), "--output_path", str(sparse),
+         "--Mapper.num_threads", str(n_threads())])
 
 
 def _guided(cfg_sfm, gpu):
