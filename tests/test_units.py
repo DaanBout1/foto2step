@@ -274,3 +274,27 @@ def test_crop_fits_tilted_floor():
     n_floor_left = (np.abs(out[:, 1]) > 1).sum()   # anything not on the cube face
     assert n_floor_left < 50, n_floor_left
     assert len(out) > 0.95 * (cube[:, 2] > 3.5).sum()
+
+
+def test_cadfit_noisy_box_becomes_6_face_solid():
+    """Experimental CAD reconstruction: noisy scan of a box (open bottom) -> valid 6-face solid."""
+    import open3d as o3d
+    from foto2step.cadfit import segment_primitives, merge_similar, label_mesh, snap_vertices, mesh_brep, shape_report
+    rng = np.random.default_rng(0)
+    m = o3d.geometry.TriangleMesh.create_box(100, 60, 80).subdivide_midpoint(5)
+    m.remove_duplicated_vertices()
+    V = np.asarray(m.vertices) + rng.normal(0, 0.3, (len(m.vertices), 3))
+    F = np.asarray(m.triangles)
+    pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(V))
+    pc.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=4, max_nn=40))
+    sel = V[:, 2] > 3
+    P, N = V[sel], np.asarray(pc.normals)[sel]
+    prims, lp = segment_primitives(P, N, 0.3)
+    prims, lp = merge_similar(prims, lp, P, 0.3)
+    assert len(prims) == 5
+    lab, _, allp, _ = label_mesh(V, F, prims, lp, P, N, 0.3, floor_z=0.0)
+    W, _, _ = snap_vertices(V, F, lab, allp, 0.3)
+    shape, info = mesh_brep(W, F, lab, allp)
+    rep = shape_report(shape)
+    assert info["closed"] and rep["valid"] and rep["solid"] and rep["faces"] == 6
+    assert abs(rep["volume_mm3"] - 100 * 60 * 80) / (100 * 60 * 80) < 0.005
