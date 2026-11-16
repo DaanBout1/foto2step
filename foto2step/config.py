@@ -53,6 +53,7 @@ DEFAULTS = {
         "crop_margin_mm": 300.0,  # marge rond markers/object
         "remove_floor": True,     # vloer-markers definieren vloervlak; vloer wordt verwijderd
         "floor_clearance_mm": 3.0,
+        "fit_floor": True,        # vloer als (licht scheef/bol) vlak fitten i.p.v. aannemen dat hij op z=0 ligt
         "isolate_objects": True,  # losse vloerruis (krullend papier, kabels, stof) weggooien
         "min_object_height_mm": 10.0,  # cluster moet minstens zo hoog boven de vloer komen
         "min_object_fraction": 0.02,   # en minstens 2% van de punten van het grootste object hebben

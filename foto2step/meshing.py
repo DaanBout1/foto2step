@@ -8,6 +8,39 @@ from scipy.spatial import cKDTree
 from .log import log
 
 
+def fit_floor(pts: np.ndarray, band_mm: float = 20.0):
+    """Robust quadratic floor height z_f(x, y) from points near the marker plane.
+
+    The marker plane is only exact where the markers lie; real floors tilt and bow by millimetres over a
+    metre, which is enough to let whole floor patches survive a fixed z-clearance. Returns a callable
+    (or None when there is too little floor) and the largest deviation from z=0 inside the data."""
+    near = pts[np.abs(pts[:, 2]) < band_mm]
+    if len(near) < 500:
+        return None, 0.0
+    rng = np.random.default_rng(0)
+    if len(near) > 300_000:
+        near = near[rng.choice(len(near), 300_000, replace=False)]
+    xy = near[:, :2] / 1000.0  # metres: well-conditioned design matrix
+
+    def design(q):
+        x, y = q[:, 0], q[:, 1]
+        return np.c_[np.ones(len(q)), x, y, x * x, x * y, y * y]
+
+    A, z = design(xy), near[:, 2]
+    w = np.ones(len(z))
+    coef = np.zeros(6)
+    for _ in range(12):  # IRLS, Tukey biweight: objects standing on the floor are outliers
+        sw = np.sqrt(w)
+        coef = np.linalg.lstsq(A * sw[:, None], z * sw, rcond=None)[0]
+        r = z - A @ coef
+        sig = 1.4826 * np.median(np.abs(r - np.median(r))) + 1e-6
+        u = r / (4.685 * sig)
+        w = np.where(np.abs(u) < 1, (1 - u * u) ** 2, 0.0)
+    f = lambda q: design(np.asarray(q)[:, :2] / 1000.0) @ coef
+    dev = float(np.max(np.abs(f(near)))) if len(near) else 0.0
+    return f, dev
+
+
 def crop_cloud(pc: o3d.geometry.PointCloud, markers_world: dict, cfg_mesh: dict, extra_box=None):
     pts = np.asarray(pc.points)
     keep = np.ones(len(pts), bool)
@@ -21,7 +54,19 @@ def crop_cloud(pc: o3d.geometry.PointCloud, markers_world: dict, cfg_mesh: dict,
     if extra_box is not None:
         keep &= np.all((pts >= extra_box[0]) & (pts <= extra_box[1]), axis=1)
     if cfg_mesh.get("remove_floor", True):
-        keep &= pts[:, 2] > float(cfg_mesh.get("floor_clearance_mm", 3.0))
+        clear = float(cfg_mesh.get("floor_clearance_mm", 3.0))
+        zf = None
+        if cfg_mesh.get("fit_floor", True):
+            zf, dev = fit_floor(pts[keep])
+            if zf is not None:
+                log(f"  vloer gefit: wijkt binnen het werkgebied tot {dev:.1f} mm af van het markervlak"
+                    + (" (scheef/bol: goed dat dit gecorrigeerd wordt)" if dev > clear else ""))
+        if zf is not None:
+            idx = np.where(keep)[0]
+            hz = pts[idx, 2] - zf(pts[idx])
+            keep[idx[hz <= clear]] = False
+        else:
+            keep &= pts[:, 2] > clear
     return pc.select_by_index(np.where(keep)[0])
 
 
@@ -53,11 +98,13 @@ def isolate_objects(pc, cfg_mesh):
     _, lab = connected_components(coo_matrix((np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])), shape=(n, n)),
                                   directed=False)
     cnt = np.bincount(lab)
-    zmax = np.full(len(cnt), -np.inf)
-    np.maximum.at(zmax, lab, pts[:, 2])
     h_min = float(cfg_mesh.get("min_object_height_mm", 10.0))
     f_min = float(cfg_mesh.get("min_object_fraction", 0.02))
-    good = (zmax >= h_min) & (cnt >= f_min * cnt.max())
+    good = cnt >= f_min * cnt.max()
+    for k in np.where(good)[0]:
+        # robust height: a few noise spikes on a floor patch must not make it an "object"
+        if np.percentile(pts[lab == k, 2], 95) < h_min:
+            good[k] = False
     if not good.any():
         return pc
     keep = good[lab]

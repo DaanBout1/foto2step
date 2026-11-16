@@ -256,3 +256,21 @@ def test_isolate_objects_drops_floor_clutter():
     out = np.asarray(isolate_objects(pc, {"voxel_mm": 1.0}).points)
     assert len(out) == len(cube)
     assert out[:, 0].max() < 100
+
+
+def test_crop_fits_tilted_floor():
+    import open3d as o3d
+    from foto2step.meshing import crop_cloud
+    rng = np.random.default_rng(1)
+    # floor tilted 8 mm per metre plus 0.5 mm noise, cube 80 mm on top near the markers
+    xy = rng.uniform(-500, 500, (200_000, 2))
+    floor = np.c_[xy, 0.008 * xy[:, 0] + 0.002 * xy[:, 1] + rng.normal(0, 0.5, len(xy))]
+    g = rng.uniform(0, 80, (20_000, 2))
+    cube = np.c_[g[:, 0], np.zeros(len(g)), g[:, 1]]
+    pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(np.vstack([floor, cube])))
+    mw = {"0": {"corners": [[-30, -30, 0], [30, -30, 0], [30, 30, 0], [-30, 30, 0]]}}
+    out = np.asarray(crop_cloud(pc, mw, {"crop_margin_mm": 600, "floor_clearance_mm": 3.0}).points)
+    assert (out[:, 2] > 3).all()
+    n_floor_left = (np.abs(out[:, 1]) > 1).sum()   # anything not on the cube face
+    assert n_floor_left < 50, n_floor_left
+    assert len(out) > 0.95 * (cube[:, 2] > 3.5).sum()
