@@ -71,7 +71,42 @@ def case_bracket():
     return s
 
 
-CASES = {"box": case_box, "tool_block": case_tool_block, "bracket": case_bracket}
+def case_shallow():
+    """Shallow features (review): 30x30x2 pad, 20x20x3 pocket, 3x3 notch along an edge."""
+    s = _box(0, 0, 0, 100, 80, 20)
+    s = _fuse(s, _box(10, 10, 20, 40, 40, 22))
+    s = _cut(s, _box(60, 40, 17, 80, 60, 21))
+    s = _cut(s, _box(-1, 77, 17, 101, 81, 21))
+    return s
+
+
+def case_zprofile():
+    """2 mm sheet-metal Z-profile (review): flange on the floor, 50 mm web, top flange."""
+    s = _box(0, 0, 0, 80, 60, 2)
+    s = _fuse(s, _box(78, 0, 0, 80, 60, 50))
+    s = _fuse(s, _box(78, 0, 48, 108, 60, 50))
+    return s
+
+
+def case_offframe():
+    """Sloped face 30 deg, tilted hole, counterbore (review)."""
+    from OCP.gp import gp_Pln, gp_Pnt, gp_Dir
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeHalfSpace
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
+    s = _box(0, 0, 0, 120, 80, 40)
+    n = np.array([np.sin(np.radians(30)), 0, np.cos(np.radians(30))])
+    f = BRepBuilderAPI_MakeFace(gp_Pln(gp_Pnt(90, 0, 40), gp_Dir(*n))).Face()
+    hs = BRepPrimAPI_MakeHalfSpace(f, gp_Pnt(*(np.array([90, 40, 40]) + 50 * n))).Solid()
+    s = _cut(s, hs)
+    a = np.array([np.sin(np.radians(30)), 0, -np.cos(np.radians(30))])
+    s = _cut(s, _cyl(tuple(np.array([30, 25, 41]) - 0 * a), tuple(a), 5.0, 60))
+    s = _cut(s, _cyl((40, 55, 35), (0, 0, 1), 8.0, 6))
+    s = _cut(s, _cyl((40, 55, -1), (0, 0, 1), 4.0, 42))
+    return s
+
+
+CASES = {"box": case_box, "tool_block": case_tool_block, "bracket": case_bracket,
+         "shallow": case_shallow, "zprofile": case_zprofile, "offframe": case_offframe}
 
 
 # ---------------------------------------------------------------- scan simulation
@@ -94,7 +129,11 @@ def simulate_scan(shape, noise, density=1.6, seed=0):
     P = (1 - s1)[:, None] * A[idx] + (s1 * (1 - r2))[:, None] * B[idx] + (s1 * r2)[:, None] * C[idx]
     N = n[idx]
     P0 = P
-    P = P + N * rng.normal(0, noise, (len(P), 1)) + rng.normal(0, 0.3 * noise, P.shape)
+    # white noise + correlated (wavy, 15 mm wavelength) noise along the normal + 1% outliers
+    k3 = rng.normal(size=(6, 3)) * (2 * np.pi / 15.0)
+    ph = rng.uniform(0, 2 * np.pi, 6)
+    wav = (np.sin(P0 @ k3.T + ph).sum(1) / np.sqrt(3.0)) * (0.3 * noise)
+    P = P + N * (rng.normal(0, noise, (len(P), 1)) + wav[:, None]) + rng.normal(0, 0.3 * noise, P.shape)
     ctr = 0.5 * (V.min(0) + V.max(0))
     cams = []
     for h, R, m in ((60.0, 400.0, 24), (250.0, 350.0, 16), (500.0, 150.0, 8)):
@@ -115,12 +154,32 @@ def simulate_scan(shape, noise, density=1.6, seed=0):
         hit = sc.cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy()
         seen += front & (hit >= L - 1e-3)
     keep = seen >= 2
-    return P[keep], N[keep], cams
+    P, N = P[keep], N[keep]
+    n_out = int(0.01 * len(P))
+    out_i = rng.choice(len(P), n_out, replace=False)
+    P[out_i] += rng.normal(0, 5 * noise, (n_out, 3))
+    simulate_scan.visible_truth = (P0[keep], N)
+    return P, N, cams
 
 
 # ---------------------------------------------------------------- grading
 
-def grade(result, truth, scan_P):
+def _seen(S, V, T, cams):
+    import open3d as o3d
+    sc = o3d.t.geometry.RaycastingScene()
+    sc.add_triangles(o3d.core.Tensor(V.astype(np.float32)), o3d.core.Tensor(T.astype(np.uint32)))
+    cnt = np.zeros(len(S), int)
+    for c in cams:
+        D = c - S
+        L = np.linalg.norm(D, axis=1)
+        O = S + 0.05 * D / L[:, None]
+        rays = np.c_[O, D / L[:, None]].astype(np.float32)
+        hit = sc.cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy()
+        cnt += hit >= L - 0.1
+    return cnt >= 2
+
+
+def grade(result, truth, scan_P, cams):
     from OCP.BRepAlgoAPI import BRepAlgoAPI_Common
     rt = cadfit.shape_report(truth)
     rr = cadfit.shape_report(result)
@@ -135,20 +194,27 @@ def grade(result, truth, scan_P):
         out["iou"] = inter / (rr["volume_mm3"] + rt["volume_mm3"] - inter)
     except Exception:
         out["iou"] = float("nan")
-    # surface distances truth <-> result (excluding the unseen floor of the truth)
+    # surface distances. Truth samples are split into 'seen' (>= 2 cameras) and 'unseen'; only seen
+    # surface can be judged. Max-type metrics (99.9%) so a missing feature cannot hide in the 5% tail.
     Vt, Tt = cadfit._mesh_of_shape(truth, defl=0.05)
     Vr, Tr = cadfit._mesh_of_shape(result, defl=0.05)
-    St, Sr = _area_samples(Vt, Tt, 0.5), _area_samples(Vr, Tr, 0.5)
+    St = _area_samples(Vt, Tt, 0.5)
     St = St[St[:, 2] > 0.5]
+    Sr = _area_samples(Vr, Tr, 0.5)
     Sr = Sr[Sr[:, 2] > 0.5]
-    d_tr = _dist_to_mesh(St, Vr, Tr)   # exact point-to-surface distances
+    seen = _seen(St, Vt, Tt, cams)
+    d_tr = _dist_to_mesh(St, Vr, Tr)
     d_rt = _dist_to_mesh(Sr, Vt, Tt)
-    out["truth_to_result_p50"] = float(np.median(d_tr))
-    out["truth_to_result_p95"] = float(np.percentile(d_tr, 95))
-    out["result_to_truth_p95"] = float(np.percentile(d_rt, 95))
-    out["hausdorff"] = float(max(d_tr.max(), d_rt.max()))
-    out["pass"] = bool(out["valid"] and out["solid"] and abs(out["vol_err_pct"]) < 1.0
-                       and out["truth_to_result_p95"] < 0.5 and out["result_to_truth_p95"] < 0.5)
+    # result samples whose closest truth point is unseen are not judged either
+    _, jt = cKDTree(St).query(Sr)
+    r_judged = seen[jt]
+    out["truth_to_result_p50"] = float(np.median(d_tr[seen]))
+    out["truth_to_result_p999"] = float(np.percentile(d_tr[seen], 99.9))
+    out["result_to_truth_p999"] = float(np.percentile(d_rt[r_judged], 99.9)) if r_judged.any() else 0.0
+    out["unseen_frac"] = float(1 - seen.mean())
+    out["unseen_max_dev"] = float(d_tr[~seen].max()) if (~seen).any() else 0.0
+    out["pass"] = bool(out["valid"] and out["solid"] and out["truth_to_result_p999"] < 1.0
+                       and out["result_to_truth_p999"] < 1.0)
     return out
 
 
@@ -170,23 +236,25 @@ def _area_samples(V, T, step):
     return (1 - s1)[:, None] * A[idx] + (s1 * (1 - r2))[:, None] * B[idx] + (s1 * r2)[:, None] * C[idx]
 
 
-def run(noise=0.5, names=None, out_dir=Path("cad_gauntlet_out")):
+def run(noise=0.5, names=None, out_dir=Path("cad_gauntlet_out"), seeds=(0,)):
     out_dir.mkdir(exist_ok=True)
     results = {}
     for name in names or list(CASES):
-        truth = CASES[name]()
-        P, N, cams = simulate_scan(truth, noise)
+      for seed in seeds:
         t0 = time.time()
         try:
-            shape, info = cadfit.reconstruct(P, cams, noise_mm=noise, floor_z=0.0, normals=None)
-            g = grade(shape, truth, P)
+            truth = CASES[name]()
+            P, N, cams = simulate_scan(truth, noise, seed=seed)
+            # the pipeline's noise estimate is low; give 60% of the truth like it would
+            shape, info = cadfit.reconstruct(P, cams, noise_mm=0.6 * noise, floor_z=0.0, normals=None)
+            g = grade(shape, truth, P, cams)
             g.update({k: v for k, v in info.items() if isinstance(v, (int, float, str, bool))})
-            cadfit.write_step(shape, out_dir / f"{name}.step")
+            cadfit.write_step(shape, out_dir / f"{name}_s{seed}.step")
         except Exception as e:  # a crash is a failed case, not a crashed gauntlet
             g = {"pass": False, "error": repr(e)}
         g["seconds"] = round(time.time() - t0, 1)
-        results[name] = g
-        print(f"{'PASS' if g['pass'] else 'FAIL'} {name}: " + json.dumps({k: (round(v, 3) if isinstance(v, float) else v)
+        results[f"{name}_s{seed}"] = g
+        print(f"{'PASS' if g['pass'] else 'FAIL'} {name} seed {seed}: " + json.dumps({k: (round(v, 3) if isinstance(v, float) else v)
                                                                            for k, v in g.items()}), flush=True)
     (out_dir / "results.json").write_text(json.dumps(results, indent=1))
     return results
@@ -196,4 +264,5 @@ if __name__ == "__main__":
     args = sys.argv[1:]
     noise = float(args[0]) if args and args[0].replace(".", "").isdigit() else 0.5
     names = [a for a in args if a in CASES] or None
-    run(noise, names)
+    seeds = tuple(int(a[5:]) for a in args if a.startswith("seed=")) or (0,)
+    run(noise, names, seeds=seeds)

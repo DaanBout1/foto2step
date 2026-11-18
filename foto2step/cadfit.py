@@ -91,13 +91,28 @@ def prim_dist(prim, P):
 
 
 def prim_normals(prim, P):
+    """Surface normals; with an orientation sign 's' (set once the data normals are oriented) they
+    point to the side the scan saw, so the two faces of a thin sheet are told apart."""
+    sg = prim.get("s", 1.0)
     if prim["type"] == "plane":
-        return np.broadcast_to(prim["n"], P.shape)
-    return cyl_normals(prim, P)
+        return np.broadcast_to(sg * prim["n"], P.shape)
+    return sg * cyl_normals(prim, P)
 
 
-def _largest_component(P, idx, link):
-    """Largest spatially connected subset of P[idx] (points closer than `link` are connected)."""
+def signed_cos(prim, Q, NQ):
+    """cos(angle) between surface and data normals after choosing the primitive's orientation sign
+    from the majority of the data (stored in prim['s'])."""
+    raw = dict(prim)
+    raw["s"] = 1.0
+    d = np.sum(prim_normals(raw, Q) * NQ, axis=1)
+    sg = 1.0 if (len(d) == 0 or np.median(d) >= 0) else -1.0
+    prim["s"] = sg
+    return sg * d
+
+
+def _largest_component(P, idx, link, min_size=None):
+    """Largest spatially connected subset of P[idx] (points closer than `link` are connected).
+    With min_size: all components of at least that size (a face split into strips by grooves)."""
     if len(idx) < 3:
         return idx
     from scipy.sparse import coo_matrix
@@ -108,22 +123,28 @@ def _largest_component(P, idx, link):
         return idx[:1]
     _, lab = connected_components(coo_matrix((np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])), shape=(n, n)),
                                   directed=False)
-    return idx[lab == np.bincount(lab).argmax()]
+    cnt = np.bincount(lab)
+    if min_size is not None:
+        big = np.where(cnt >= min_size)[0]
+        if len(big):
+            return idx[np.isin(lab, big)]
+    return idx[lab == cnt.argmax()]
 
 
-def segment_primitives(P, N, noise_mm, min_pts=None, max_prims=60, seed=0, cylinders=True):
+def segment_primitives(P, N, noise_mm, min_pts=None, max_prims=60, seed=0, cylinders=True, oriented=False):
     """Efficient-RANSAC style multi-primitive detection (planes + cylinders) with connectivity.
 
     Returns (prims, labels): labels[i] = index into prims or -1."""
     rng = np.random.default_rng(seed)
     n_all = len(P)
     eps = max(2.5 * noise_mm, 0.8)
-    cos_t = np.cos(np.radians(16.0))
+    cos_t = np.cos(np.radians(min(30.0, 12.0 + 15.0 * noise_mm)))  # PCA normals get noisier with noise
     link = 3.0 * max(noise_mm, 0.5) + 1.5
     min_pts = min_pts or max(120, int(0.0015 * n_all))
     labels = -np.ones(n_all, int)
     prims = []
     tree = cKDTree(P)
+    fails = 0
     while len(prims) < max_prims:
         free = np.where(labels < 0)[0]
         if len(free) < min_pts:
@@ -175,7 +196,7 @@ def segment_primitives(P, N, noise_mm, min_pts=None, max_prims=60, seed=0, cylin
             if ok.sum() < 3:
                 scores.append(0)
                 continue
-            cs = np.abs(np.sum(prim_normals(c, Q[ok]) * NQ[ok], axis=1))
+            cs = signed_cos(c, Q[ok], NQ[ok]) if oriented else np.abs(np.sum(prim_normals(c, Q[ok]) * NQ[ok], axis=1))
             scores.append(int((cs > cos_t).sum()))
         order = np.argsort(scores)[::-1][:6]
         best, best_idx = None, None
@@ -184,9 +205,10 @@ def segment_primitives(P, N, noise_mm, min_pts=None, max_prims=60, seed=0, cylin
             for _ in range(3):  # inliers -> refit -> inliers
                 d = np.abs(prim_dist(c, P[free]))
                 ok = d < eps
-                cs = np.abs(np.sum(prim_normals(c, P[free][ok]) * N[free][ok], axis=1))
+                cs = (signed_cos(c, P[free][ok], N[free][ok]) if oriented
+                      else np.abs(np.sum(prim_normals(c, P[free][ok]) * N[free][ok], axis=1)))
                 idx = free[ok][cs > cos_t]
-                idx = _largest_component(P, idx, link)
+                idx = _largest_component(P, idx, link, min_size=min_pts if c["type"] == "plane" else None)
                 if len(idx) < min_pts:
                     break
                 if c["type"] == "plane":
@@ -204,11 +226,27 @@ def segment_primitives(P, N, noise_mm, min_pts=None, max_prims=60, seed=0, cylin
                 span = _angular_span(ang)
                 if span < np.radians(25) or c["r"] > 4 * np.ptp(q @ c["a"]) + 50:
                     continue
+                # model selection: a cylinder must fit clearly better than a plane, close to the noise,
+                # and its arc must be evenly covered (not two flat walls of a channel)
+                rc = np.sqrt(np.mean(prim_dist(c, P[idx]) ** 2))
+                rp = np.sqrt(np.mean(plane_dist(fit_plane(P[idx]), P[idx]) ** 2))
+                if rc > 1.8 * max(noise_mm, 0.2) or rp < 1.3 * rc:
+                    continue
+                a_s = np.mod(ang - ang.min(), 2 * np.pi)
+                hist, _ = np.histogram(a_s, bins=8, range=(0, max(span, 1e-6)))
+                if (hist > 0.25 * len(idx) / 8).mean() < 0.75:
+                    continue
                 c["ang"] = span
             if best is None or len(idx) > len(best_idx):
                 best, best_idx = c, idx
         if best is None or len(best_idx) < min_pts:
-            break
+            fails += 1
+            if fails >= 4:
+                break
+            continue
+        fails = 0
+        if oriented:
+            signed_cos(best, P[best_idx], N[best_idx])
         r = np.abs(prim_dist(best, P[best_idx]))
         best["rms"] = float(np.sqrt(np.mean(r ** 2)))
         best["n_pts"] = int(len(best_idx))
@@ -225,7 +263,9 @@ def segment_primitives(P, N, noise_mm, min_pts=None, max_prims=60, seed=0, cylin
             best_k, best_d = -1, eps
             for k in cand:
                 dd = abs(prim_dist(prims[k], P[i:i + 1])[0])
-                if dd < best_d:
+                cs = prim_normals(prims[k], P[i:i + 1])[0] @ N[i]
+                cs = cs if oriented else abs(cs)
+                if dd < best_d and cs > np.cos(np.radians(35)):
                     best_k, best_d = k, dd
             labels[i] = best_k
     return prims, labels
@@ -251,13 +291,23 @@ def merge_similar(prims, labels, P, noise_mm):
                 Pi, Pj = P[labels == i], P[labels == j]
                 if len(Pi) == 0 or len(Pj) == 0:
                     continue
+                if a.get("s", 1.0) * b.get("s", 1.0) * (a["n"] @ b["n"] if a["type"] == "plane" else 1.0) < 0:
+                    continue  # opposite faces (e.g. both sides of a sheet) are never the same surface
                 if a["type"] == "plane" and abs(a["n"] @ b["n"]) < np.cos(np.radians(3)):
                     continue
                 if a["type"] == "cylinder" and (abs(a["a"] @ b["a"]) < np.cos(np.radians(3)) or abs(a["r"] - b["r"]) > 2 * eps):
                     continue
-                if np.median(np.abs(prim_dist(a, Pj))) < eps and np.median(np.abs(prim_dist(b, Pi))) < eps:
+                tol = max(0.3, 6.0 * noise_mm / np.sqrt(min(len(Pi), len(Pj))))
+                if a["type"] == "cylinder":
+                    tol = max(tol, 0.5 * eps)
+                if abs(np.median(prim_dist(a, Pj))) < tol and abs(np.median(prim_dist(b, Pi))) < tol:
                     both = np.r_[Pi, Pj]
                     new = fit_plane(both) if a["type"] == "plane" else fit_cylinder(both, a["a"], a["p"], a["r"])
+                    if "s" in a:
+                        if a["type"] == "plane":
+                            new["s"] = a["s"] * float(np.sign(new["n"] @ a["n"]) or 1.0)
+                        else:
+                            new["s"] = a["s"]
                     new["rms"] = float(np.sqrt(np.mean(prim_dist(new, both) ** 2)))
                     new["n_pts"] = len(both)
                     prims[i] = new
@@ -1148,7 +1198,7 @@ def reference_volume(P, Nrm, floor_z=None, depth=9):
     return occ, m
 
 
-def cell_solid(prims, P, occ, floor_z=None, margin=3.0, grid=0.6, min_frac=0.5, max_cells=20000, smooth=0.3,
+def cell_solid(prims, P, occ, floor_z=None, margin=0.3, grid=0.6, min_frac=0.5, max_cells=20000, smooth=0.3,
                noise_mm=0.5):
     """Cell complex of the bounding box split by every fitted surface; keep inside cells; return the
     boundary as one solid. Returns (shape, report)."""
@@ -1159,8 +1209,10 @@ def cell_solid(prims, P, occ, floor_z=None, margin=3.0, grid=0.6, min_frac=0.5, 
     from OCP.TopExp import TopExp_Explorer
     from OCP.TopAbs import TopAbs_SOLID
     from OCP.TopoDS import TopoDS
-    lo = P.min(0) - margin
-    hi = P.max(0) + margin
+    # tight box at the robust data extent: where no fitted surface bounds the part (narrow sheet
+    # edges that got too few points) the box face is the best estimate, so it must not sit mm outside
+    lo = np.percentile(P, 0.02, axis=0) - margin
+    hi = np.percentile(P, 99.98, axis=0) + margin
     if floor_z is not None:
         lo[2] = floor_z
     box = BRepPrimAPI_MakeBox(gp_Pnt(*lo), gp_Pnt(*hi)).Shape()
@@ -1192,7 +1244,10 @@ def cell_solid(prims, P, occ, floor_z=None, margin=3.0, grid=0.6, min_frac=0.5, 
     keep, fracs, vols = [], [], []
     for c in cells:
         V, T = _mesh_of_shape(c, defl=0.1)
-        if len(T) == 0:
+        if len(T) == 0:  # keep fracs/keep aligned with cells (review finding)
+            fracs.append(0.0)
+            vols.append(0.0)
+            keep.append(False)
             continue
         bl, bh = V.min(0), V.max(0)
         sel = np.all((G >= bl) & (G <= bh), axis=1)
@@ -1220,8 +1275,8 @@ def cell_solid(prims, P, occ, floor_z=None, margin=3.0, grid=0.6, min_frac=0.5, 
     fr = np.array(fracs)
     vol = np.array(vols)
     if smooth > 0 and len(cells) > 1:
-        keep = _graphcut_cells(cells[:len(fr)], fr, vol, smooth, P=P, eps=max(1.0, 2.5 * noise_mm),
-                               floor_z=floor_z)
+        keep = _graphcut_cells(cells, fr, vol, smooth, P=P, eps=max(1.0, 2.5 * noise_mm),
+                               floor_z=floor_z, prims=prims)
     chosen = [c for c, k in zip(cells, keep) if k]
     shape = _boundary_solid(chosen)
     rep = {"surfaces": len(prims), "cells": len(cells), "inside": len(chosen),
@@ -1229,7 +1284,8 @@ def cell_solid(prims, P, occ, floor_z=None, margin=3.0, grid=0.6, min_frac=0.5, 
     return shape, rep
 
 
-def _graphcut_cells(cells, frac, vol, lam, P=None, eps=1.0, step=1.0, w_unsup=4.0, floor_z=None):
+def _graphcut_cells(cells, frac, vol, lam, P=None, eps=1.0, step=1.0, w_unsup=4.0, floor_z=None,
+                    prims=None, w_orient=5.0):
     """Binary labelling of cells by exact min-cut.
     unary: volume that disagrees with the reference occupancy;
     pairwise: every face that would become part of the model surface (between an inside and an outside
@@ -1240,6 +1296,7 @@ def _graphcut_cells(cells, frac, vol, lam, P=None, eps=1.0, step=1.0, w_unsup=4.
     owner = {}
     farea = {}
     fsup = {}
+    face_pts = {}
     tree = cKDTree(P) if P is not None else None
     for i, c in enumerate(cells):
         for f in _faces_of(c):
@@ -1248,6 +1305,7 @@ def _graphcut_cells(cells, frac, vol, lam, P=None, eps=1.0, step=1.0, w_unsup=4.
             if h not in farea:
                 S, a = _sample_face(f, step)
                 farea[h] = a
+                face_pts[h] = S
                 if floor_z is not None and len(S) and np.all(np.abs(S[:, 2] - floor_z) < 0.05):
                     fsup[h] = 1.0  # the underside on the floor is never seen: no penalty
                 elif tree is not None and len(S):
@@ -1259,6 +1317,31 @@ def _graphcut_cells(cells, frac, vol, lam, P=None, eps=1.0, step=1.0, w_unsup=4.
     vol = np.maximum(vol, 1e-3)
     unary_in = (1 - frac) * vol
     unary_out = frac * vol
+    # oriented evidence: a supported face on a fitted surface whose normal points to the side the
+    # cameras saw -> the cell in front of it is outside, the cell behind it inside. This decides thin
+    # walls/sheets where the point-based occupancy mixes both sides.
+    if prims is not None:
+        from OCP.BRepClass3d import BRepClass3d_SolidClassifier
+        from OCP.gp import gp_Pnt
+        from OCP.TopAbs import TopAbs_IN
+        for h, own in owner.items():
+            if len(own) != 2 or fsup.get(h, 0) < 0.3:
+                continue
+            S = face_pts.get(h)
+            if S is None or len(S) == 0:
+                continue
+            x = S[len(S) // 2]
+            dk = [abs(prim_dist(pr, x[None])[0]) for pr in prims]
+            k = int(np.argmin(dk))
+            if dk[k] > 0.05 or "s" not in prims[k]:
+                continue
+            nrm = prim_normals(prims[k], x[None])[0]
+            q = x + 0.05 * nrm
+            cls = BRepClass3d_SolidClassifier(cells[own[0]], gp_Pnt(*map(float, q)), 1e-6)
+            front, back = (own[0], own[1]) if cls.State() == TopAbs_IN else (own[1], own[0])
+            w = w_orient * fsup[h] * farea[h]
+            unary_in[front] += w
+            unary_out[back] += w
     for h, own in owner.items():
         w = farea[h] * (lam + w_unsup * (1.0 - fsup[h]))
         if len(own) == 1:          # face on the bounding box: boundary if the cell is inside
@@ -1308,7 +1391,7 @@ def _boundary_solid(cells):
             fx.Perform()
             solids.append(fx.Solid())
     if not solids:
-        return sh
+        raise RuntimeError("geen gesloten solid: geen enkele cel als binnen geclassificeerd")
     if len(solids) == 1:
         res = solids[0]
     else:
@@ -1324,7 +1407,7 @@ def _boundary_solid(cells):
     return u.Shape()
 
 
-def refine_primitives(prims, labels, P, N, noise_mm, iters=4):
+def refine_primitives(prims, labels, P, N, noise_mm, iters=4, oriented=False):
     """Re-collect inliers for every primitive from ALL points near its region (distance + normal) and
     refit with fixed orientation. Segmentation inliers are gathered around the first, biased fit; this
     removes that self-consistent bias (e.g. radius of a groove that is only a short arc)."""
@@ -1338,7 +1421,9 @@ def refine_primitives(prims, labels, P, N, noise_mm, iters=4):
         for _ in range(iters):
             Q, NQ = P[near], N[near]
             d = np.abs(prim_dist(p, Q))
-            cs = np.abs(np.sum(prim_normals(p, Q) * NQ, axis=1))
+            cs = np.sum(prim_normals(p, Q) * NQ, axis=1)
+            if not oriented:
+                cs = np.abs(cs)
             inl = (d < eps) & (cs > np.cos(np.radians(20)))
             if inl.sum() < 10:
                 break
@@ -1370,7 +1455,9 @@ def prune_redundant(prims, labels, P, noise_mm, frac=0.75, small=0.08):
         Q = P[labels == k]
         if len(Q) == 0 or len(Q) > small * n_max:
             continue
-        others = [j for j in alive if j != k]
+        tq = cKDTree(Q)
+        others = [j for j in alive if j != k and np.any(np.isfinite(
+            tq.query(P[labels == j][:: max(1, (labels == j).sum() // 3000)], distance_upper_bound=3 * eps)[0]))]
         if not others:
             continue
         D = np.stack([np.abs(prim_dist(prims[j], Q)) for j in others], 1)
@@ -1384,7 +1471,7 @@ def prune_redundant(prims, labels, P, noise_mm, frac=0.75, small=0.08):
     return [prims[k] for k in alive], labels
 
 
-def regularize_orientations(prims, labels, P, tol_deg=4.0):
+def regularize_orientations(prims, labels, P, tol_deg=4.0, noise_mm=None, up=None):
     """Machined parts are mostly built on one orthogonal frame: snap plane normals and cylinder axes
     that are within tol_deg of a frame axis exactly onto it, then refit offsets / radii. Removes the
     0.5-2 deg wobble that noisy fits give and makes parallel faces exactly parallel."""
@@ -1393,22 +1480,46 @@ def regularize_orientations(prims, labels, P, tol_deg=4.0):
         return prims
     w = np.array([p["n_pts"] if "n_pts" in p else (labels == k).sum() for k, p in planes], float)
     order = np.argsort(-w)
-    e1 = planes[order[0]][1]["n"].copy()
-    e2 = None
-    for o in order[1:]:
-        n = planes[o][1]["n"]
-        if abs(n @ e1) < np.sin(np.radians(10)):
-            e2 = _unit(n - (n @ e1) * e1)
-            break
-    if e2 is None:
-        return prims
-    e3 = np.cross(e1, e2)
+    if up is not None:
+        # the floor fixes one axis exactly; the other two come from the dominant vertical planes,
+        # averaged (modulo 90 deg) over all of them, weighted by size
+        e3 = _unit(np.asarray(up, float))
+        u0, v0 = _perp_basis(e3)
+        acc = 0j
+        for (k, p), wk in zip(planes, w):
+            n = p["n"] - (p["n"] @ e3) * e3
+            if np.linalg.norm(n) < np.cos(np.radians(10)):
+                continue
+            ang = np.arctan2(n @ v0, n @ u0)
+            acc += wk * np.exp(4j * ang)
+        if acc == 0:
+            return prims
+        th = np.angle(acc) / 4
+        e1 = np.cos(th) * u0 + np.sin(th) * v0
+        e2 = np.cross(e3, e1)
+    else:
+        e1 = planes[order[0]][1]["n"].copy()
+        e2 = None
+        for o in order[1:]:
+            n = planes[o][1]["n"]
+            if abs(n @ e1) < np.sin(np.radians(10)):
+                e2 = _unit(n - (n @ e1) * e1)
+                break
+        if e2 is None:
+            return prims
+        e3 = np.cross(e1, e2)
     R = np.array([e1, e2, e3])
-    cos_t = np.cos(np.radians(tol_deg))
     out = []
     for k, p in enumerate(prims):
         p = dict(p)
         Q = P[labels == k]
+        # orientation uncertainty grows when a region is small compared to the noise: allow a larger
+        # snap angle for narrow faces (e.g. a 12 mm high end face scanned with 1 mm noise)
+        tol = tol_deg
+        if noise_mm and len(Q) > 3:
+            ext = np.sort(np.ptp(Q - Q.mean(0), axis=0))[-2] if p["type"] == "plane" else np.ptp(Q @ p["a"])
+            tol = min(15.0, max(tol_deg, np.degrees(np.arctan(3.0 * noise_mm / max(ext, 1e-6)))))
+        cos_t = np.cos(np.radians(tol))
         if p["type"] == "plane":
             c = R @ p["n"]
             i = int(np.argmax(np.abs(c)))
@@ -1468,22 +1579,41 @@ def reconstruct(P, cams, noise_mm, floor_z=0.0, normals=None, voxel=None, log_fn
     import open3d as o3d
     from .meshing import orient_by_visibility
     t0 = time.time()
-    voxel = voxel or max(0.5, 1.2 * noise_mm)
     pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(np.asarray(P, float)))
+    pc, _ = pc.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.5)
+    est = estimate_noise(np.asarray(pc.points))
+    if est is not None:
+        log_fn(f"  CAD: ruis uit vlakfit {est:.2f} mm (opgegeven {noise_mm:.2f} mm)")
+        noise_mm = max(noise_mm, est)
+    voxel = voxel or max(0.5, 1.2 * noise_mm)
     pc = pc.voxel_down_sample(voxel)
-    pc, _ = pc.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-    pc.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=max(3.0, 5 * voxel), max_nn=40))
+    r_n = max(3.0, 5 * voxel)
+    dens = len(pc.points) / max(1e-9, _approx_area(np.asarray(pc.points), voxel))
+    pc.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=r_n, max_nn=int(np.clip(4 * np.pi * r_n ** 2 * dens, 40, 400))))
     Pd = np.asarray(pc.points)
-    Nd, dec = orient_by_visibility(Pd, np.asarray(pc.normals), cams)
-    seg_sel = Pd[:, 2] > floor_z + max(3.0, 4 * noise_mm) if floor_z is not None else np.ones(len(Pd), bool)
-    Ps, Ns = Pd[seg_sel], Nd[seg_sel]
-    prims, lab = segment_primitives(Ps, Ns, noise_mm)
+    if normals is not None:
+        Nd = np.asarray(normals)
+        Nd = Nd[cKDTree(np.asarray(P)).query(Pd)[1]]
+        dec = 1.0
+    else:
+        Nd, dec = orient_by_visibility(Pd, np.asarray(pc.normals), cams)
+    # all points take part (thin flanges and steps just above the floor too); floor points were cropped
+    Ps, Ns = Pd, Nd
+    min_pts = max(40, int(25.0 * dens))  # ~25 mm^2 of surface, independent of point density
+    prims, lab = segment_primitives(Ps, Ns, noise_mm, min_pts=min_pts, oriented=True)
     prims, lab = merge_similar(prims, lab, Ps, noise_mm)
-    prims = regularize_orientations(prims, lab, Ps)
+    prims = regularize_orientations(prims, lab, Ps, noise_mm=noise_mm,
+                                    up=(0, 0, 1.0) if floor_z is not None else None)
     prims, lab = prune_redundant(prims, lab, Ps, noise_mm)
-    prims = refine_primitives(prims, lab, Ps, Ns, noise_mm)
+    prims = refine_primitives(prims, lab, Ps, Ns, noise_mm, oriented=True)
+    prims, lab = merge_similar(prims, lab, Ps, noise_mm)  # snapping can make planes coincide
     log_fn(f"  CAD: {len(prims)} oppervlakken ({sum(p['type'] == 'plane' for p in prims)} vlak, "
            f"{sum(p['type'] == 'cylinder' for p in prims)} cilinder), {np.mean(lab >= 0):.0%} van de punten verklaard")
+    hyp = thickness_hypotheses(prims, lab, Ps, floor_z=floor_z)
+    if hyp:
+        log_fn(f"  CAD: {len(hyp)} verborgen achtervlak(ken) voorgesteld uit gemeten wanddikte(s)")
+    reconstruct.last = dict(prims=prims, lab=lab, P=Ps, N=Ns, hyp=hyp)
+    prims = prims + hyp
     occ = hoppe_occupancy(Pd, Nd, floor_z=floor_z)
     shape, rep = cell_solid(prims, Pd, occ, floor_z=floor_z, noise_mm=noise_mm)
     shape = clean_solid(shape)
@@ -1491,6 +1621,117 @@ def reconstruct(P, cams, noise_mm, floor_z=0.0, normals=None, voxel=None, log_fn
             "ambiguous": rep["ambiguous_cells"], "oriented": dec, "explained": float(np.mean(lab >= 0)),
             "t": time.time() - t0}
     return shape, info
+
+
+def thickness_hypotheses(prims, labels, P, max_t=6.0, max_new=12, floor_z=None):
+    """Sheet metal / thin walls: when a plane is only seen from one side, its back face is unseen.
+    Wall thicknesses measured elsewhere in the part (pairs of opposite, parallel, overlapping planes)
+    are used to propose the hidden back faces; the cell selection only uses them where the occupancy
+    needs a closure. Returns a list of hypothesis planes (marked 'hyp')."""
+    planes = [(k, p) for k, p in enumerate(prims) if p["type"] == "plane" and "s" in p]
+    def on(p):
+        return p["s"] * p["n"]
+    def overlap(i, j, n):
+        u, v = _perp_basis(n)
+        A, B = P[labels == i], P[labels == j]
+        if len(A) == 0 or len(B) == 0:
+            return False
+        a2, b2 = np.c_[A @ u, A @ v], np.c_[B @ u, B @ v]
+        lo = np.maximum(a2.min(0), b2.min(0))
+        hi = np.minimum(a2.max(0), b2.max(0))
+        return bool(np.all(hi - lo > 2.0))
+    ts, paired = [], set()
+    thickness_hypotheses.pairs = []
+    for a in range(len(planes)):
+        for b in range(a + 1, len(planes)):
+            (i, p), (j, q) = planes[a], planes[b]
+            if on(p) @ on(q) > -np.cos(np.radians(3)):
+                continue
+            t = abs((-p["d"]) - (-q["d"] * float(np.sign(p["n"] @ q["n"]))))
+            ci, cj = P[labels == i].mean(0), P[labels == j].mean(0)
+            is_wall = (cj - ci) @ on(p) < 0  # q lies behind p: material in between (not a slot/pocket)
+            if is_wall and 0.3 < t < max_t and overlap(i, j, p["n"]):
+                # the back of each must lie behind the front (wall material between them)
+                thickness_hypotheses.pairs.append((i, j, round(t, 2)))
+                ts.append(t)
+                paired.update((i, j))
+    if not ts:
+        return []
+    ts = sorted(ts)
+    uniq = []
+    for t in ts:
+        if not uniq or t - uniq[-1] > 0.5:
+            uniq.append(t)
+    uniq = uniq[:3]
+    out = []
+    for k, p in planes:
+        if k in paired:
+            continue
+        for t in uniq:
+            n = on(p)
+            q = {"type": "plane", "n": p["n"].copy(), "d": p["d"] + p["s"] * t, "s": -p["s"], "hyp": True,
+                 "rms": 0.0, "n_pts": 0}
+            if floor_z is not None and abs(n[2]) > 0.99 and abs(-q["d"] * q["n"][2] - floor_z) < 1.5:
+                continue  # the floor itself closes it
+            # check: plane moved by t against its outward normal
+            x = -p["d"] * p["n"]
+            assert abs((x - t * n) @ q["n"] + q["d"]) < 1e-6
+            out.append(q)
+            if len(out) >= max_new:
+                return out
+    return out
+
+
+def estimate_noise(P, n_planes=4, band=1.5):
+    """Surface noise (sigma, mm) from robust residuals of the largest planes; None if no plane.
+    A narrow band keeps the opposite side of thin sheets (>= 2 mm away) out of the statistics."""
+    import open3d as o3d
+    pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(P))
+    pc.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=4.0, max_nn=60))
+    sig = []
+    for _ in range(n_planes):
+        if len(pc.points) < 500:
+            break
+        m, idx = pc.segment_plane(1.0, 3, 1000)
+        Q = np.asarray(pc.points)
+        r = Q @ np.asarray(m[:3]) + m[3]
+        # only points whose local surface is parallel to the plane (not walls touching it)
+        par = np.abs(np.asarray(pc.normals) @ np.asarray(m[:3])) > 0.97
+        r = np.where(par, r, np.inf)
+        b = band
+        for _ in range(3):
+            near = np.abs(r) < b
+            if near.sum() < 300:
+                break
+            rr = r[near] - np.median(r[near])
+            sg = 1.4826 * np.median(np.abs(rr))
+            sg /= _trunc_mad_factor(b / max(sg, 1e-6))
+            break  # single pass: growing the band pulls in the other side of thin sheets
+        if near.sum() < 300:
+            break
+        sig.append((near.sum(), sg))
+        pc = pc.select_by_index(np.where(np.abs(r) < max(b, 2.0))[0], invert=True)
+    if not sig:
+        return None
+    # a plane that straddles two nearby parallel faces (thin sheet) only inflates its estimate:
+    # take the smallest estimate among well-supported planes
+    good = [b_ for a, b_ in sig if a >= 1000] or [b_ for _, b_ in sig]
+    return float(min(good))
+
+
+def _trunc_mad_factor(c):
+    """MAD of a normal distribution truncated at +-c sigma, relative to the untruncated MAD."""
+    from scipy.stats import norm
+    c = max(float(c), 0.7)
+    mass = 2 * norm.cdf(c) - 1
+    q = norm.ppf(0.5 + 0.25 * mass)
+    return float(q / 0.6744897501960817)
+
+
+def _approx_area(P, voxel):
+    """Surface area estimate: number of occupied surface voxels x voxel^2."""
+    q = np.unique(np.floor(P / (2 * voxel)).astype(np.int64), axis=0)
+    return len(q) * (2 * voxel) ** 2
 
 
 def clean_solid(shape):

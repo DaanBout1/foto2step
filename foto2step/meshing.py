@@ -130,7 +130,8 @@ def orient_by_visibility(pts, nrm, cam_centers, splat_mm=None, max_cams=400, chu
         d, _ = cKDTree(pts).query(pts[:: max(1, len(pts) // 20000)], k=2)
         # about one point spacing: bigger splats make real-scan floaters block everything, smaller
         # ones leak; the remaining leaks are equal on both sides and the neighbour vote fixes the rest
-        splat_mm = float(np.clip(1.0 * np.median(d[:, 1]), 0.3, 2.0))
+        # median NN distance is ~half the real spacing for random samples: 2x closes the sheet (review)
+        splat_mm = float(np.clip(2.0 * np.median(d[:, 1]), 0.4, 3.0))
     # splat mesh: one triangle per point, in the tangent plane, circumradius ~splat_mm
     t1 = np.cross(nrm, np.where(np.abs(nrm[:, :1]) < 0.9, [[1.0, 0, 0]], [[0, 1.0, 0]]))
     t1 /= np.maximum(np.linalg.norm(t1, axis=1, keepdims=True), 1e-12)
