@@ -270,6 +270,9 @@ class Pipeline:
                 log(f"[deel {name}] al klaar (hervat)")
                 continue
             log(f"[deel {name}] mesh + STEP ({len(pc.points):,} punten)")
+            raw_pts = np.asarray(pc.points).copy()
+            cad_mode = self.cfg["export"].get("cad", "auto")
+            path_mesh = pdir / f"{name}_mesh.step" if cad_mode not in (False, "false", "nee") else path
             pc = pc.voxel_down_sample(cm["voxel_mm"] * 0.7)
             if pc.has_normals() and np.any(np.asarray(pc.normals)):
                 n = np.asarray(pc.normals)
@@ -309,7 +312,7 @@ class Pipeline:
             F = np.asarray(dec.triangles)
             rgb = PART_COLORS[h % len(PART_COLORS)]
             merge = self.cfg["export"].get("merge_coplanar", True)
-            sinfo = write_part(path, name, V, F, rgb, merge)
+            sinfo = write_part(path_mesh, name, V, F, rgb, merge)
             tri = V[F]
             sinfo["volume_mm3"] = float(abs(np.einsum("ij,ij->i", tri[:, 0], np.cross(tri[:, 1], tri[:, 2])).sum()) / 6.0) \
                 if sinfo["kind"] == "solid" else None
@@ -317,16 +320,24 @@ class Pipeline:
             chk = {}
             sinfo["valid"] = None
             if verify is True or (verify == "auto" and sinfo["brep_faces"] <= 60000):
-                chk = read_step_check(path)
+                chk = read_step_check(path_mesh)
                 sinfo["valid"] = bool(chk["faces"] == sinfo["brep_faces"] and
                                       (chk["solids"] >= 1 if sinfo["kind"] == "solid" else chk["shells"] >= 1))
-            log(f"  {path.name}: {sinfo['kind']}, {sinfo['brep_faces']} vlakken ({sinfo['planar_faces']} samengevoegde vlakken, "
+            log(f"  {path_mesh.name}: {sinfo['kind']}, {sinfo['brep_faces']} vlakken ({sinfo['planar_faces']} samengevoegde vlakken, "
                 f"{sinfo['triangles']} driehoeken), teruggelezen={'ja' if chk else 'overgeslagen'}"
                 + (f" geldig={sinfo['valid']}" if chk else "")
                 + f", afwijking punten->STEP mediaan {acc['median']:.2f} / 95% {acc['p95']:.2f} mm")
+            cad_rep = None
+            if path_mesh != path:
+                cad_rep = self._cad_part(name, raw_pts, noise, h, b, path, rgb, cad_mode)
+                if not (cad_rep and cad_rep.get("accepted")):
+                    import shutil
+                    shutil.copyfile(path_mesh, path)
+                    log(f"  {path.name}: mesh-versie gebruikt" + (f" (CAD afgekeurd: {cad_rep.get('reason', '')})" if cad_rep else ""))
             shapes.append((h, name, rgb))
             filled_frac = filled_area / max(dec.get_surface_area(), 1e-9)
             part_info.append({"name": name, "step": str(path.relative_to(self.out)), **sinfo, "readback": chk,
+                              "cad": cad_rep,
                               "filled_fraction": float(filled_frac),
                               "deviation_mm": acc, "features": {k: v for k, v in feat.items() if k != "regions"},
                               "n_planes": sum(1 for r in feat.get("regions", []) if r["type"] == "plane"),
@@ -337,17 +348,51 @@ class Pipeline:
         if not shapes:
             raise RuntimeError("Geen enkel onderdeel kon worden opgebouwd (te weinig punten). Zie fotoprotocol.")
         asm = self.out / f"{self.cfg['project']}_samenstelling.step"
-        parts_mesh = []
-        for h, name, rgb in shapes:
-            m = o3d.io.read_triangle_mesh(str(bdir / f"{h:02d}_{name}_final.ply"))
-            parts_mesh.append((name, np.asarray(m.vertices), np.asarray(m.triangles), rgb))
-        write_assembly(asm, self.cfg["project"], parts_mesh, self.cfg["export"].get("merge_coplanar", True))
-        del parts_mesh
-        log(f"Samenstelling geschreven: {asm.name} ({len(shapes)} delen)")
+        if any((p.get("cad") or {}).get("accepted") for p in part_info):
+            from .cadfit import write_named_step
+            from .stepexport import read_step_shape
+            occ_parts = [(name, read_step_shape(pdir / f"{name}.step"), rgb) for h, name, rgb in shapes]
+            write_named_step(asm, occ_parts, self.cfg["project"])
+            log(f"Samenstelling geschreven: {asm.name} ({len(shapes)} delen, CAD)")
+            parts_mesh = None
+        else:
+            parts_mesh = []
+        if parts_mesh is not None:
+            for h, name, rgb in shapes:
+                m = o3d.io.read_triangle_mesh(str(bdir / f"{h:02d}_{name}_final.ply"))
+                parts_mesh.append((name, np.asarray(m.vertices), np.asarray(m.triangles), rgb))
+            write_assembly(asm, self.cfg["project"], parts_mesh, self.cfg["export"].get("merge_coplanar", True))
+            del parts_mesh
+            log(f"Samenstelling geschreven: {asm.name} ({len(shapes)} delen)")
         (self.work / "parts.json").write_text(json.dumps(part_info, indent=1, default=_np))
         (self.out / "bewegingen.json").write_text(json.dumps({"joints": info["joints"], "bodies": [
             {"name": b["name"], "marker_ids": b["marker_ids"], "vast": b["static"]} for b in info["bodies"]]},
             indent=1, default=_np))
+
+    def _cad_part(self, name, pts, noise, h, b, path, rgb, mode):
+        """Try the CAD (fitted-surface) reconstruction of one part. Writes <path> when accepted."""
+        from . import cadfit
+        try:
+            cams = self._cams(self.states[0])
+            C = np.array([c[2] for c in cams])
+            floor_z = 0.0 if (b.get("static") and self.cfg["mesh"].get("remove_floor", True)) else None
+            log(f"  CAD-reconstructie (vlakken + cilinders -> solid)")
+            shape, info = cadfit.reconstruct(pts, C, noise_mm=max(noise, 0.2), floor_z=floor_z)
+            q = cadfit.quality(shape, pts, noise, floor_z)
+            rep = {**info, **{k: v for k, v in q.items()}}
+            if mode is True or mode in ("true", "ja"):
+                rep["accepted"] = bool(q["valid"])
+            if rep["accepted"]:
+                cadfit.write_named_step(path, [(name, shape, rgb)])
+                log(f"  {path.name}: CAD-solid, {q['faces']} vlakken ({info['surfaces']} gefitte oppervlakken), "
+                    f"afwijking punten->STEP mediaan {q['dev_median']:.2f} / 95% {q['dev_p95']:.2f} mm")
+            else:
+                rep["reason"] = ("geen geldige solid" if not (q["valid"] and q["solid"]) else
+                                 f"past slecht op de scan (mediaan {q['dev_median']:.2f} mm)")
+            return rep
+        except Exception as e:  # never lose the part because the CAD path failed
+            log(f"  CAD-reconstructie mislukt: {e!r}")
+            return {"accepted": False, "reason": repr(e)}
 
     def _orient_normals(self, pc, h, info):
         # orient towards the cameras of the reference state (points are in reference pose)

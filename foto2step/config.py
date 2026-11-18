@@ -83,6 +83,10 @@ DEFAULTS = {
         "merge_coplanar": True,
         "urdf": True,
         "force_solid": False,     # true = ook grote ongeziene openingen dichtmaken (altijd solid, minder nauwkeurig daar)
+        # CAD-reconstructie: vlakken/cilinders fitten en daar een echte solid van bouwen (strakke vlakken,
+        # scherpe randen, ruis weggemiddeld). auto = gebruiken als hij geldig is en goed op de scan past,
+        # anders de mesh-STEP. De mesh-versie wordt altijd ook geschreven als <naam>_mesh.step.
+        "cad": "auto",            # auto | true | false
     },
     "states": [],                 # [{name: A, images: pad/naar/fotos_of_video}]
 }

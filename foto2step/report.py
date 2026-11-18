@@ -147,6 +147,21 @@ def write_report(work: Path, out: Path, cfg: dict, states: list):
           f"<td>{p.get('filled_fraction', 0) * 100:.1f}%</td>"
           f"<td>{p['n_planes']} / {len(p['cylinders'])}</td><td>{_r((p.get('volume_mm3') or 0) / 1e6, 3) if p.get('volume_mm3') else '-'} dm³</td></tr>")
     a("</table></div>")
+    cads = [p for p in parts if p.get("cad")]
+    if cads:
+        a("<h2>CAD-reconstructie (gefitte vlakken en cilinders)</h2><div class='panel'><table><tr><th>Deel</th>"
+          "<th>Resultaat</th><th>Solid-vlakken</th><th>Gefitte oppervlakken</th><th>Afwijking scan-&gt;solid mediaan / 95%</th>"
+          "<th>Punten verklaard</th></tr>")
+        for p in cads:
+            c = p["cad"]
+            res = ("<b>CAD-solid gebruikt</b>" if c.get("accepted") else
+                   f"<span class=warn>mesh gebruikt</span> ({html.escape(str(c.get('reason', '')))})")
+            dev = (f"{_r(c['dev_median'])} / {_r(c['dev_p95'])} mm" if "dev_median" in c else "-")
+            a(f"<tr><td>{html.escape(p['name'])}</td><td>{res}</td><td>{c.get('faces', '-')}</td>"
+              f"<td>{c.get('surfaces', '-')}</td><td>{dev}</td><td>{c.get('explained', 0) * 100:.0f}%</td></tr>")
+        a("</table><p>De CAD-solid bestaat uit echte vlakken en cilinders, gefit op duizenden meetpunten: de ruis middelt "
+          "weg. De mesh-versie staat altijd ook in <code>onderdelen/&lt;naam&gt;_mesh.step</code>. Wat de camera's niet "
+          "zagen (onderkant, diepe gaten) is aangevuld en dus niet gemeten.</p></div>")
     cyl = [(p["name"], c) for p in parts for c in p["cylinders"]]
     if cyl:
         a("<h2>Gevonden cilinders (assen, gaten, buizen)</h2><div class='panel'><table><tr><th>Deel</th><th>Ø</th><th>Lengte</th><th>As-richting</th><th>RMS</th></tr>")

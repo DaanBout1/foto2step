@@ -18,6 +18,8 @@ All lengths in mm. Freeform regions (NURBS) plug into the same arrangement/selec
 from __future__ import annotations
 
 import numpy as np
+import time
+
 from scipy.optimize import least_squares
 from scipy.spatial import cKDTree
 
@@ -1074,3 +1076,502 @@ def weld(W, F, lab, tol=1e-3):
     F2 = inv[F]
     ok = (F2[:, 0] != F2[:, 1]) & (F2[:, 1] != F2[:, 2]) & (F2[:, 0] != F2[:, 2])
     return W2, F2[ok], lab[ok]
+
+
+# ----------------------------------------------------------------------------------------------
+# 4. volumetric cell complex (robust): split the bounding box by all fitted surfaces into cells,
+#    classify every cell inside/outside with a watertight reference volume, keep the boundary.
+#    The result is closed by construction and every face lies exactly on a fitted surface.
+# ----------------------------------------------------------------------------------------------
+
+def _surface_face(prim, lo, hi):
+    """Unbounded-enough face of a primitive covering the whole box (lo, hi)."""
+    from OCP.gp import gp_Pln, gp_Pnt, gp_Dir, gp_Ax3, gp_Cylinder
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
+    diag = float(np.linalg.norm(hi - lo))
+    ctr = 0.5 * (lo + hi)
+    if prim["type"] == "plane":
+        n = prim["n"]
+        c = ctr - (ctr @ n + prim["d"]) * n
+        u, _ = _perp_basis(n)
+        ax = gp_Ax3(gp_Pnt(*c), gp_Dir(*n), gp_Dir(*u))
+        return BRepBuilderAPI_MakeFace(gp_Pln(ax), -diag, diag, -diag, diag).Face()
+    a, p0, r = prim["a"], prim["p"], prim["r"]
+    t0 = (ctr - p0) @ a
+    u, _ = _perp_basis(a)
+    ax = gp_Ax3(gp_Pnt(*(p0 + t0 * a)), gp_Dir(*a), gp_Dir(*u))
+    return BRepBuilderAPI_MakeFace(gp_Cylinder(ax, r), 0.0, 2 * np.pi, -diag, diag).Face()
+
+
+def _mesh_of_shape(shape, defl=0.2):
+    from OCP.BRepMesh import BRepMesh_IncrementalMesh
+    from OCP.BRep import BRep_Tool
+    from OCP.TopLoc import TopLoc_Location
+    from OCP.TopAbs import TopAbs_REVERSED
+    BRepMesh_IncrementalMesh(shape, defl, False, 0.3, True)
+    Vs, Fs, off = [], [], 0
+    for f in _faces_of(shape):
+        loc = TopLoc_Location()
+        t = BRep_Tool.Triangulation_s(f, loc)
+        if t is None:
+            continue
+        tr = loc.Transformation()
+        V = np.array([[t.Node(i).Transformed(tr).X(), t.Node(i).Transformed(tr).Y(), t.Node(i).Transformed(tr).Z()]
+                      for i in range(1, t.NbNodes() + 1)])
+        T = np.array([t.Triangle(i).Get() for i in range(1, t.NbTriangles() + 1)]) - 1
+        if f.Orientation() == TopAbs_REVERSED:
+            T = T[:, ::-1]
+        Vs.append(V)
+        Fs.append(T + off)
+        off += len(V)
+    if not Vs:
+        return np.zeros((0, 3)), np.zeros((0, 3), int)
+    return np.vstack(Vs), np.vstack(Fs)
+
+
+def reference_volume(P, Nrm, floor_z=None, depth=9):
+    """Watertight occupancy from the oriented scan points (untrimmed screened Poisson).
+    Returns occ(points)->bool. Below the floor is always outside."""
+    import open3d as o3d
+    pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(P))
+    pc.normals = o3d.utility.Vector3dVector(Nrm)
+    m, _ = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pc, depth=depth, scale=1.3)
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(m))
+
+    def occ(Q):
+        q = o3d.core.Tensor(np.asarray(Q, np.float32))
+        inside = scene.compute_occupancy(q, nsamples=3).numpy() > 0.5
+        if floor_z is not None:
+            inside &= Q[:, 2] > floor_z
+        return inside
+    return occ, m
+
+
+def cell_solid(prims, P, occ, floor_z=None, margin=3.0, grid=0.6, min_frac=0.5, max_cells=20000, smooth=0.3,
+               noise_mm=0.5):
+    """Cell complex of the bounding box split by every fitted surface; keep inside cells; return the
+    boundary as one solid. Returns (shape, report)."""
+    import open3d as o3d
+    from OCP.BOPAlgo import BOPAlgo_MakerVolume
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+    from OCP.gp import gp_Pnt
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_SOLID
+    from OCP.TopoDS import TopoDS
+    lo = P.min(0) - margin
+    hi = P.max(0) + margin
+    if floor_z is not None:
+        lo[2] = floor_z
+    box = BRepPrimAPI_MakeBox(gp_Pnt(*lo), gp_Pnt(*hi)).Shape()
+    mv = BOPAlgo_MakerVolume()
+    mv.AddArgument(box)
+    for pr in prims:
+        # untrimmed (trimming the faces to the box first makes OCC lose cells); cells that form
+        # outside the box are discarded below
+        mv.AddArgument(_surface_face(pr, lo, hi))
+    mv.SetRunParallel(True)
+    mv.SetIntersect(True)
+    mv.Perform()
+    if mv.HasErrors():
+        raise RuntimeError("cellencomplex mislukt")
+    cells = []
+    ex = TopExp_Explorer(mv.Shape(), TopAbs_SOLID)
+    while ex.More():
+        c = TopoDS.Solid(ex.Current())
+        ex.Next()
+        Vc, _ = _mesh_of_shape(c, defl=0.5)
+        if len(Vc) and np.all(Vc.min(0) >= lo - 0.01) and np.all(Vc.max(0) <= hi + 0.01):
+            cells.append(c)
+    if len(cells) > max_cells:
+        raise RuntimeError(f"te veel cellen ({len(cells)})")
+    # grid samples once, occupancy of the reference once
+    axes = [np.arange(lo[i] + grid / 2, hi[i], grid) for i in range(3)]
+    G = np.stack(np.meshgrid(*axes, indexing="ij"), -1).reshape(-1, 3)
+    ref_in = occ(G)
+    keep, fracs, vols = [], [], []
+    for c in cells:
+        V, T = _mesh_of_shape(c, defl=0.1)
+        if len(T) == 0:
+            continue
+        bl, bh = V.min(0), V.max(0)
+        sel = np.all((G >= bl) & (G <= bh), axis=1)
+        idx = np.where(sel)[0]
+        if len(idx) == 0:
+            # tiny cell: classify its centroid
+            ctr = V.mean(0)[None]
+            f = float(occ(ctr)[0])
+            fracs.append(f)
+            vols.append(0.0)
+            keep.append(f >= min_frac)
+            continue
+        sc = o3d.t.geometry.RaycastingScene()
+        sc.add_triangles(o3d.core.Tensor(V.astype(np.float32)), o3d.core.Tensor(T.astype(np.uint32)))
+        incell = sc.compute_occupancy(o3d.core.Tensor(G[idx].astype(np.float32))).numpy() > 0.5
+        n_in = incell.sum()
+        if n_in == 0:
+            ctr = V.mean(0)[None]
+            f = float(occ(ctr)[0])
+        else:
+            f = float(ref_in[idx][incell].mean())
+        fracs.append(f)
+        vols.append(n_in * grid ** 3)
+        keep.append(f >= min_frac)
+    fr = np.array(fracs)
+    vol = np.array(vols)
+    if smooth > 0 and len(cells) > 1:
+        keep = _graphcut_cells(cells[:len(fr)], fr, vol, smooth, P=P, eps=max(1.0, 2.5 * noise_mm),
+                               floor_z=floor_z)
+    chosen = [c for c, k in zip(cells, keep) if k]
+    shape = _boundary_solid(chosen)
+    rep = {"surfaces": len(prims), "cells": len(cells), "inside": len(chosen),
+           "ambiguous_cells": int(((fr > 0.2) & (fr < 0.8)).sum())}
+    return shape, rep
+
+
+def _graphcut_cells(cells, frac, vol, lam, P=None, eps=1.0, step=1.0, w_unsup=4.0, floor_z=None):
+    """Binary labelling of cells by exact min-cut.
+    unary: volume that disagrees with the reference occupancy;
+    pairwise: every face that would become part of the model surface (between an inside and an outside
+    cell, or between an inside cell and the bounding box) costs lam x area, plus w_unsup x area for the
+    part of it that no scan point supports. A real surface was seen by the cameras; a protrusion made of
+    unsupported faces is a classification error, not geometry."""
+    import networkx as nx
+    owner = {}
+    farea = {}
+    fsup = {}
+    tree = cKDTree(P) if P is not None else None
+    for i, c in enumerate(cells):
+        for f in _faces_of(c):
+            h = hash(f)
+            owner.setdefault(h, []).append(i)
+            if h not in farea:
+                S, a = _sample_face(f, step)
+                farea[h] = a
+                if floor_z is not None and len(S) and np.all(np.abs(S[:, 2] - floor_z) < 0.05):
+                    fsup[h] = 1.0  # the underside on the floor is never seen: no penalty
+                elif tree is not None and len(S):
+                    d, _ = tree.query(S, distance_upper_bound=eps)
+                    fsup[h] = float(np.isfinite(d).mean())
+                else:
+                    fsup[h] = 1.0
+    G = nx.DiGraph()
+    vol = np.maximum(vol, 1e-3)
+    unary_in = (1 - frac) * vol
+    unary_out = frac * vol
+    for h, own in owner.items():
+        w = farea[h] * (lam + w_unsup * (1.0 - fsup[h]))
+        if len(own) == 1:          # face on the bounding box: boundary if the cell is inside
+            unary_in[own[0]] += w
+        elif len(own) == 2:
+            a, b = own
+            for u, v in ((a, b), (b, a)):
+                if G.has_edge(u, v):
+                    G[u][v]["capacity"] += w
+                else:
+                    G.add_edge(u, v, capacity=w)
+    for i in range(len(cells)):
+        G.add_edge("s", i, capacity=float(unary_out[i]))  # cut when i is outside
+        G.add_edge(i, "t", capacity=float(unary_in[i]))   # cut when i is inside
+    _, (S, _) = nx.minimum_cut(G, "s", "t")
+    return [i in S for i in range(len(cells))]
+
+
+def _boundary_solid(cells):
+    """Faces used by exactly one chosen cell form the outer boundary; sew -> solid -> merge coplanar."""
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing, BRepBuilderAPI_MakeSolid
+    from OCP.ShapeFix import ShapeFix_Solid
+    from OCP.ShapeUpgrade import ShapeUpgrade_UnifySameDomain
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_SHELL
+    from OCP.TopoDS import TopoDS
+    cnt, rep = {}, {}
+    for c in cells:
+        for f in _faces_of(c):
+            h = hash(f)
+            cnt[h] = cnt.get(h, 0) + 1
+            rep.setdefault(h, f)
+    sew = BRepBuilderAPI_Sewing(1e-4)
+    for h, n in cnt.items():
+        if n == 1:
+            sew.Add(rep[h])
+    sew.Perform()
+    sh = sew.SewedShape()
+    solids = []
+    ex = TopExp_Explorer(sh, TopAbs_SHELL)
+    while ex.More():
+        shell = TopoDS.Shell(ex.Current())
+        ex.Next()
+        ms = BRepBuilderAPI_MakeSolid(shell)
+        if ms.IsDone():
+            fx = ShapeFix_Solid(ms.Solid())
+            fx.Perform()
+            solids.append(fx.Solid())
+    if not solids:
+        return sh
+    if len(solids) == 1:
+        res = solids[0]
+    else:
+        from OCP.BRep import BRep_Builder
+        from OCP.TopoDS import TopoDS_Compound
+        b = BRep_Builder()
+        res = TopoDS_Compound()
+        b.MakeCompound(res)
+        for s_ in solids:
+            b.Add(res, s_)
+    u = ShapeUpgrade_UnifySameDomain(res, True, True, False)
+    u.Build()
+    return u.Shape()
+
+
+def refine_primitives(prims, labels, P, N, noise_mm, iters=4):
+    """Re-collect inliers for every primitive from ALL points near its region (distance + normal) and
+    refit with fixed orientation. Segmentation inliers are gathered around the first, biased fit; this
+    removes that self-consistent bias (e.g. radius of a groove that is only a short arc)."""
+    eps = max(2.5 * noise_mm, 0.8)
+    tree = cKDTree(P)
+    for k, p in enumerate(prims):
+        own = np.where(labels == k)[0]
+        if len(own) < 10:
+            continue
+        near = np.unique(np.concatenate(tree.query_ball_point(P[own], 2 * eps)))
+        for _ in range(iters):
+            Q, NQ = P[near], N[near]
+            d = np.abs(prim_dist(p, Q))
+            cs = np.abs(np.sum(prim_normals(p, Q) * NQ, axis=1))
+            inl = (d < eps) & (cs > np.cos(np.radians(20)))
+            if inl.sum() < 10:
+                break
+            Qi = Q[inl]
+            if p["type"] == "plane":
+                p["d"] = -float(np.mean(Qi @ p["n"]))
+            else:
+                a = p["a"]
+                u, v = _perp_basis(a)
+                q2 = np.c_[Qi @ u, Qi @ v]
+                c0 = np.array([p["p"] @ u, p["p"] @ v])
+                sol = least_squares(lambda x: np.linalg.norm(q2 - x[:2], axis=1) - x[2], np.r_[c0, p["r"]],
+                                    loss="soft_l1", f_scale=noise_mm, max_nfev=200)
+                p["p"] = sol.x[0] * u + sol.x[1] * v + float(np.median(Qi @ a)) * a
+                p["r"] = float(abs(sol.x[2]))
+        prims[k] = p
+    return prims
+
+
+def prune_redundant(prims, labels, P, noise_mm, frac=0.75, small=0.08):
+    """Drop small primitives whose points are already explained (by distance) by other primitives:
+    strips along an edge where the noise made neither neighbour claim the points. They would add
+    false cuts and faces. Points are handed to the nearest remaining primitive."""
+    eps = max(2.5 * noise_mm, 0.8)
+    n_max = max((labels == k).sum() for k in range(len(prims))) if prims else 0
+    alive = list(range(len(prims)))
+    order = sorted(alive, key=lambda k: (labels == k).sum())
+    for k in order:
+        Q = P[labels == k]
+        if len(Q) == 0 or len(Q) > small * n_max:
+            continue
+        others = [j for j in alive if j != k]
+        if not others:
+            continue
+        D = np.stack([np.abs(prim_dist(prims[j], Q)) for j in others], 1)
+        if (D.min(1) < 1.5 * eps).mean() >= frac:
+            alive.remove(k)
+            idx = np.where(labels == k)[0]
+            labels[idx] = np.array(others)[D.argmin(1)]
+    remap = -np.ones(len(prims) + 1, int)
+    remap[alive] = np.arange(len(alive))
+    labels = np.where(labels >= 0, remap[labels], -1)
+    return [prims[k] for k in alive], labels
+
+
+def regularize_orientations(prims, labels, P, tol_deg=4.0):
+    """Machined parts are mostly built on one orthogonal frame: snap plane normals and cylinder axes
+    that are within tol_deg of a frame axis exactly onto it, then refit offsets / radii. Removes the
+    0.5-2 deg wobble that noisy fits give and makes parallel faces exactly parallel."""
+    planes = [(k, p) for k, p in enumerate(prims) if p["type"] == "plane"]
+    if not planes:
+        return prims
+    w = np.array([p["n_pts"] if "n_pts" in p else (labels == k).sum() for k, p in planes], float)
+    order = np.argsort(-w)
+    e1 = planes[order[0]][1]["n"].copy()
+    e2 = None
+    for o in order[1:]:
+        n = planes[o][1]["n"]
+        if abs(n @ e1) < np.sin(np.radians(10)):
+            e2 = _unit(n - (n @ e1) * e1)
+            break
+    if e2 is None:
+        return prims
+    e3 = np.cross(e1, e2)
+    R = np.array([e1, e2, e3])
+    cos_t = np.cos(np.radians(tol_deg))
+    out = []
+    for k, p in enumerate(prims):
+        p = dict(p)
+        Q = P[labels == k]
+        if p["type"] == "plane":
+            c = R @ p["n"]
+            i = int(np.argmax(np.abs(c)))
+            if abs(c[i]) >= cos_t:
+                n = np.sign(c[i]) * R[i]
+                p["n"] = n
+                p["d"] = -float(np.median(Q @ n)) if len(Q) else p["d"]
+                p["snapped"] = True
+        else:
+            c = R @ p["a"]
+            i = int(np.argmax(np.abs(c)))
+            if abs(c[i]) >= cos_t:
+                a = R[i]
+                u, v = _perp_basis(a)
+                q2 = np.c_[Q @ u, Q @ v]
+                # geometric circle fit with the axis fixed (algebraic fits are biased on short arcs)
+                c0 = np.array([p["p"] @ u, p["p"] @ v])
+
+                def res(x):
+                    return np.linalg.norm(q2 - x[:2], axis=1) - x[2]
+                sol = least_squares(res, np.r_[c0, p["r"]], loss="soft_l1", f_scale=0.5, max_nfev=200)
+                cx, cy, r = sol.x[0], sol.x[1], float(abs(sol.x[2]))
+                if 0.5 * p["r"] < r < 2 * p["r"]:
+                    p["a"] = a
+                    p["p"] = cx * u + cy * v + float(np.median(Q @ a)) * a
+                    p["r"] = r
+                    p["snapped"] = True
+        out.append(p)
+    return out
+
+
+def hoppe_occupancy(P, Nrm, floor_z=None, k=24):
+    """Inside test from oriented scan points (normals pointing outward, towards the cameras):
+    a query is inside when it lies behind the local tangent planes of its nearest scan points."""
+    tree = cKDTree(P)
+
+    def occ(Q, chunk=200_000):
+        Q = np.asarray(Q)
+        inside = np.zeros(len(Q), bool)
+        for i in range(0, len(Q), chunk):  # chunked: a full grid x k neighbours does not fit in RAM
+            q = Q[i:i + chunk]
+            _, j = tree.query(q, k=k)
+            s = np.einsum("qkd,qkd->qk", q[:, None, :] - P[j], Nrm[j])
+            inside[i:i + chunk] = np.median(s, axis=1) < 0
+        if floor_z is not None:
+            inside &= Q[:, 2] > floor_z
+        return inside
+    return occ
+
+
+# ----------------------------------------------------------------------------------------------
+# 5. driver
+# ----------------------------------------------------------------------------------------------
+
+def reconstruct(P, cams, noise_mm, floor_z=0.0, normals=None, voxel=None, log_fn=log):
+    """Scan points of one part (+ camera centres) -> (solid, info). Cell-complex method."""
+    import open3d as o3d
+    from .meshing import orient_by_visibility
+    t0 = time.time()
+    voxel = voxel or max(0.5, 1.2 * noise_mm)
+    pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(np.asarray(P, float)))
+    pc = pc.voxel_down_sample(voxel)
+    pc, _ = pc.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+    pc.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=max(3.0, 5 * voxel), max_nn=40))
+    Pd = np.asarray(pc.points)
+    Nd, dec = orient_by_visibility(Pd, np.asarray(pc.normals), cams)
+    seg_sel = Pd[:, 2] > floor_z + max(3.0, 4 * noise_mm) if floor_z is not None else np.ones(len(Pd), bool)
+    Ps, Ns = Pd[seg_sel], Nd[seg_sel]
+    prims, lab = segment_primitives(Ps, Ns, noise_mm)
+    prims, lab = merge_similar(prims, lab, Ps, noise_mm)
+    prims = regularize_orientations(prims, lab, Ps)
+    prims, lab = prune_redundant(prims, lab, Ps, noise_mm)
+    prims = refine_primitives(prims, lab, Ps, Ns, noise_mm)
+    log_fn(f"  CAD: {len(prims)} oppervlakken ({sum(p['type'] == 'plane' for p in prims)} vlak, "
+           f"{sum(p['type'] == 'cylinder' for p in prims)} cilinder), {np.mean(lab >= 0):.0%} van de punten verklaard")
+    occ = hoppe_occupancy(Pd, Nd, floor_z=floor_z)
+    shape, rep = cell_solid(prims, Pd, occ, floor_z=floor_z, noise_mm=noise_mm)
+    shape = clean_solid(shape)
+    info = {"surfaces": len(prims), "cells": rep["cells"], "inside": rep["inside"],
+            "ambiguous": rep["ambiguous_cells"], "oriented": dec, "explained": float(np.mean(lab >= 0)),
+            "t": time.time() - t0}
+    return shape, info
+
+
+def clean_solid(shape):
+    """Keep the largest solid, fix it and merge coplanar faces."""
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_SOLID
+    from OCP.TopoDS import TopoDS
+    from OCP.GProp import GProp_GProps
+    from OCP.BRepGProp import BRepGProp
+    from OCP.ShapeFix import ShapeFix_Shape
+    from OCP.ShapeUpgrade import ShapeUpgrade_UnifySameDomain
+    best, bv = None, -1.0
+    ex = TopExp_Explorer(shape, TopAbs_SOLID)
+    while ex.More():
+        so = TopoDS.Solid(ex.Current())
+        ex.Next()
+        g = GProp_GProps()
+        BRepGProp.VolumeProperties_s(so, g)
+        if abs(g.Mass()) > bv:
+            best, bv = so, abs(g.Mass())
+    if best is None:
+        return shape
+    fx = ShapeFix_Shape(best)
+    fx.Perform()
+    s = fx.Shape()
+    u = ShapeUpgrade_UnifySameDomain(s, True, True, False)
+    u.Build()
+    return u.Shape()
+
+
+# ----------------------------------------------------------------------------------------------
+# 6. pipeline helpers: quality gate, named single-part STEP, assembly of OCC shapes
+# ----------------------------------------------------------------------------------------------
+
+def quality(shape, P, noise_mm, floor_z=None):
+    """Deviation of the scan points from the CAD solid, and the acceptance decision."""
+    rep = shape_report(shape, P, step=0.5)
+    ok = bool(rep["valid"] and rep["solid"] and rep["faces"] >= 4
+              and rep["dev_median"] <= max(1.0, 2.0 * noise_mm))
+    rep["accepted"] = ok
+    return rep
+
+
+def write_named_step(path, parts, assembly_name=None):
+    """STEP (AP214) with names and colours. parts: list of (name, shape, rgb 0..1). One part -> a
+    single named solid; several -> an assembly with one component per part (moving parts stay separate)."""
+    from OCP.STEPCAFControl import STEPCAFControl_Writer
+    from OCP.XCAFDoc import XCAFDoc_DocumentTool, XCAFDoc_ColorSurf
+    from OCP.TDocStd import TDocStd_Document
+    from OCP.TCollection import TCollection_ExtendedString
+    from OCP.TDataStd import TDataStd_Name
+    from OCP.Quantity import Quantity_Color, Quantity_TOC_RGB
+    from OCP.STEPControl import STEPControl_AsIs
+    from OCP.Interface import Interface_Static
+    from OCP.TopoDS import TopoDS_Compound
+    from OCP.BRep import BRep_Builder
+    doc = TDocStd_Document(TCollection_ExtendedString("MDTV-XCAF"))
+    st = XCAFDoc_DocumentTool.ShapeTool_s(doc.Main())
+    ct = XCAFDoc_DocumentTool.ColorTool_s(doc.Main())
+    if len(parts) == 1:
+        name, shape, rgb = parts[0]
+        lab = st.AddShape(shape, False)
+        TDataStd_Name.Set_s(lab, TCollection_ExtendedString(name))
+        ct.SetColor(lab, Quantity_Color(*map(float, rgb), Quantity_TOC_RGB), XCAFDoc_ColorSurf)
+    else:
+        comp = TopoDS_Compound()
+        BRep_Builder().MakeCompound(comp)
+        asm = st.NewShape()
+        TDataStd_Name.Set_s(asm, TCollection_ExtendedString(assembly_name or "samenstelling"))
+        from OCP.TopLoc import TopLoc_Location
+        for name, shape, rgb in parts:
+            plab = st.AddShape(shape, False)
+            TDataStd_Name.Set_s(plab, TCollection_ExtendedString(name))
+            ct.SetColor(plab, Quantity_Color(*map(float, rgb), Quantity_TOC_RGB), XCAFDoc_ColorSurf)
+            cl = st.AddComponent(asm, plab, TopLoc_Location())
+            TDataStd_Name.Set_s(cl, TCollection_ExtendedString(name))
+        st.UpdateAssemblies()
+    Interface_Static.SetCVal_s("write.step.unit", "MM")
+    Interface_Static.SetCVal_s("write.step.schema", "AP214")
+    w = STEPCAFControl_Writer()
+    w.SetNameMode(True)
+    w.SetColorMode(True)
+    w.Transfer(doc, STEPControl_AsIs)
+    return w.Write(str(path)) == 1

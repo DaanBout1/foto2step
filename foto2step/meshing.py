@@ -113,6 +113,66 @@ def isolate_objects(pc, cfg_mesh):
     return pc.select_by_index(np.where(keep)[0])
 
 
+def orient_by_visibility(pts, nrm, cam_centers, splat_mm=None, max_cams=400, chunk=4_000_000):
+    """Orient unsigned normals by visibility: a normal must point to the side from which the point
+    was actually seen. Every point becomes a small disc (splat); from just in front of the point on
+    each side (+n / -n) a ray goes to every camera, and the side with more unoccluded cameras wins.
+
+    The old rule (towards the nearest camera) is wrong for vertical faces photographed from above: the
+    nearest camera is often across the object. Returns (oriented normals, fraction decided)."""
+    pts = np.asarray(pts, np.float64)
+    nrm = np.asarray(nrm, np.float64)
+    nrm = nrm / np.maximum(np.linalg.norm(nrm, axis=1, keepdims=True), 1e-12)
+    C = np.asarray(cam_centers, np.float64)
+    if len(C) > max_cams:
+        C = C[np.linspace(0, len(C) - 1, max_cams).astype(int)]
+    if splat_mm is None:
+        d, _ = cKDTree(pts).query(pts[:: max(1, len(pts) // 20000)], k=2)
+        # about one point spacing: bigger splats make real-scan floaters block everything, smaller
+        # ones leak; the remaining leaks are equal on both sides and the neighbour vote fixes the rest
+        splat_mm = float(np.clip(1.0 * np.median(d[:, 1]), 0.3, 2.0))
+    # splat mesh: one triangle per point, in the tangent plane, circumradius ~splat_mm
+    t1 = np.cross(nrm, np.where(np.abs(nrm[:, :1]) < 0.9, [[1.0, 0, 0]], [[0, 1.0, 0]]))
+    t1 /= np.maximum(np.linalg.norm(t1, axis=1, keepdims=True), 1e-12)
+    t2 = np.cross(nrm, t1)
+    ang = np.radians([90.0, 210.0, 330.0])
+    V = np.concatenate([pts + splat_mm * (np.cos(a) * t1 + np.sin(a) * t2) for a in ang], axis=0)
+    n = len(pts)
+    F = np.c_[np.arange(n), np.arange(n) + n, np.arange(n) + 2 * n]
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.core.Tensor(V.astype(np.float32)), o3d.core.Tensor(F.astype(np.uint32)))
+    off = max(1.7 * splat_mm, 1.0)
+    votes = np.zeros(n)
+    per = max(1, chunk // max(1, len(C)))
+    for i0 in range(0, n, per):
+        sl = slice(i0, min(n, i0 + per))
+        for sgn in (1.0, -1.0):
+            O = pts[sl] + sgn * off * nrm[sl]
+            D = C[None, :, :] - O[:, None, :]
+            L = np.linalg.norm(D, axis=2)
+            front = (np.einsum("pcd,pd->pc", D, sgn * nrm[sl]) > 0)
+            rays = np.concatenate([np.repeat(O, len(C), 0), (D / L[..., None]).reshape(-1, 3)], 1)
+            hit = scene.cast_rays(o3d.core.Tensor(rays.astype(np.float32)))["t_hit"].numpy().reshape(len(O), len(C))
+            free = (hit >= L - off) & front
+            votes[sl] += sgn * free.sum(1)
+    out = nrm.copy()
+    out[votes < 0] *= -1
+    # consistency: neighbours on the same smooth surface (normals nearly parallel) must agree in sign;
+    # a few iterations of weighted majority fix isolated and weakly-voted points
+    tree = cKDTree(pts)
+    _, nb = tree.query(pts, k=16)
+    conf = np.abs(votes) + 0.5
+    for _ in range(10):
+        dots = np.einsum("nd,nkd->nk", out, out[nb])
+        same = np.abs(dots) > 0.9
+        s = (np.sign(dots) * same * conf[nb]).sum(1)
+        flip = s < -conf
+        if not flip.any():
+            break
+        out[flip] *= -1
+    return out, float(np.mean(votes != 0))
+
+
 def noise_estimate(pc, k=16, sample=20000):
     """Robust local surface noise (mm): RMS distance to local plane over k-NN, median over sample."""
     pts = np.asarray(pc.points)
