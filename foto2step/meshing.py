@@ -113,7 +113,7 @@ def isolate_objects(pc, cfg_mesh):
     return pc.select_by_index(np.where(keep)[0])
 
 
-def orient_by_visibility(pts, nrm, cam_centers, splat_mm=None, max_cams=400, chunk=4_000_000):
+def orient_by_visibility(pts, nrm, cam_centers, splat_mm=None, max_cams=400, chunk=4_000_000, _factor=2.0):
     """Orient unsigned normals by visibility: a normal must point to the side from which the point
     was actually seen. Every point becomes a small disc (splat); from just in front of the point on
     each side (+n / -n) a ray goes to every camera, and the side with more unoccluded cameras wins.
@@ -131,7 +131,10 @@ def orient_by_visibility(pts, nrm, cam_centers, splat_mm=None, max_cams=400, chu
         # about one point spacing: bigger splats make real-scan floaters block everything, smaller
         # ones leak; the remaining leaks are equal on both sides and the neighbour vote fixes the rest
         # median NN distance is ~half the real spacing for random samples: 2x closes the sheet (review)
-        splat_mm = float(np.clip(2.0 * np.median(d[:, 1]), 0.4, 3.0))
+        splat_mm = float(np.clip(_factor * np.median(d[:, 1]), 0.4, 3.0))
+        auto = True
+    else:
+        auto = False
     # splat mesh: one triangle per point, in the tangent plane, circumradius ~splat_mm
     t1 = np.cross(nrm, np.where(np.abs(nrm[:, :1]) < 0.9, [[1.0, 0, 0]], [[0, 1.0, 0]]))
     t1 /= np.maximum(np.linalg.norm(t1, axis=1, keepdims=True), 1e-12)
@@ -156,6 +159,9 @@ def orient_by_visibility(pts, nrm, cam_centers, splat_mm=None, max_cams=400, chu
             hit = scene.cast_rays(o3d.core.Tensor(rays.astype(np.float32)))["t_hit"].numpy().reshape(len(O), len(C))
             free = (hit >= L - off) & front
             votes[sl] += sgn * free.sum(1)
+    if auto and _factor > 1.0 and np.mean(votes != 0) < 0.9:
+        # real scans have floaters: closed splat sheets then block too many rays -> smaller splats
+        return orient_by_visibility(pts, nrm, cam_centers, None, max_cams, chunk, _factor=1.0)
     out = nrm.copy()
     out[votes < 0] *= -1
     # consistency: neighbours on the same smooth surface (normals nearly parallel) must agree in sign;

@@ -384,6 +384,11 @@ class Pipeline:
                 rep["accepted"] = bool(q["valid"])
             if rep["accepted"]:
                 cadfit.write_named_step(path, [(name, shape, rgb)])
+                ok, why = cadfit.roundtrip_ok(path, shape)
+                if not ok:  # never hand out a STEP that does not read back correctly
+                    rep["accepted"] = False
+                    rep["reason"] = f"STEP-controle: {why}"
+                    return rep
                 log(f"  {path.name}: CAD-solid, {q['faces']} vlakken ({info['surfaces']} gefitte oppervlakken), "
                     f"afwijking punten->STEP mediaan {q['dev_median']:.2f} / 95% {q['dev_p95']:.2f} mm")
             else:

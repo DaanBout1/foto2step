@@ -250,6 +250,9 @@ def run(noise=0.5, names=None, out_dir=Path("cad_gauntlet_out"), seeds=(0,)):
             g = grade(shape, truth, P, cams)
             g.update({k: v for k, v in info.items() if isinstance(v, (int, float, str, bool))})
             cadfit.write_step(shape, out_dir / f"{name}_s{seed}.step")
+            ok, why = cadfit.roundtrip_ok(out_dir / f"{name}_s{seed}.step", shape)
+            g["roundtrip"] = why
+            g["pass"] = bool(g["pass"] and ok)
         except Exception as e:  # a crash is a failed case, not a crashed gauntlet
             g = {"pass": False, "error": repr(e)}
         g["seconds"] = round(time.time() - t0, 1)

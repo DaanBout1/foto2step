@@ -114,6 +114,8 @@ Staat dezelfde foto er als DNG én als JPEG/HEIC, dan wordt de DNG gebruikt. Een
 * Foto's met een ander beeldformaat (andere lens/zoom) worden overgeslagen en gemeld.
 
 **Machine-oppervlak**
+* Eerste echte test (kaal staal blok): ±0,5–0,8 mm ruis, op de glimmende groefzijde 3–4 mm. **Mat maken is de
+  grootste winst** voor de CAD-reconstructie.
 * Egale lak, glimmend metaal, zwart of transparant = slecht. Gebruik **scanspray** (bv. AESUB, verdampt vanzelf) of plak
   willekeurige stippen/speckle-stickers of afplaktape met krabbels. Hoe meer willekeurige textuur, hoe beter.
 * Diffuus licht, geen bewegende schaduwen (blijf zelf uit de lamp).
@@ -184,6 +186,33 @@ Delen handmatig afbakenen (ook met maar 1 stand): `motion: manual_bodies: [{name
    snijlijnen van vlakken teruggebracht (scherpe randen), gaten gedicht, begrensde vereenvoudiging.
 7. **STEP**: B-rep met gedeelde topologie, coplanaire facetten samengevoegd tot echte vlakken, solid, AP214 in mm,
    met namen en kleuren, teruggelezen en gecontroleerd.
+8. **CAD-reconstructie** (`export.cad: auto`, standaard aan): in plaats van driehoekjes een échte solid uit
+   gefitte vlakken en cilinders, zoals je hem zelf in CAD zou tekenen:
+   * normalen gericht met een zichtbaarheidstest (stralen naar de camera's), ruis gemeten uit de scan zelf;
+   * vlakken en cilinders gezocht (RANSAC), samengevoegd, recht gezet op het assenstelsel van het onderdeel
+     (evenwijdig/haaks), opnieuw gefit op duizenden punten: de ruis middelt weg;
+   * voorstellen voor wat niet te zien was: lage wandjes bij kleine treden, achterkant van plaatwerk uit de
+     gemeten plaatdikte;
+   * alle oppervlakken verdelen de ruimte in cellen; per cel binnen/buiten via de scan en de georiënteerde vlakken,
+     opgelost met een minimale snede (grensvlakken zonder meetpunten zijn duur) → altijd een gesloten solid.
+   * Kwaliteitspoort: alleen gebruikt als hij geldig is én goed op de scan past, anders de mesh-STEP.
+     De mesh-versie staat altijd ook in `onderdelen/<naam>_mesh.step`. Het rapport toont welke gebruikt is.
+
+### CAD-gauntlet (`python tests/cad_gauntlet.py 0.5`)
+Onderdelen met exact bekende maten, gesimuleerde scan (ruis + golvende ruis + 1% uitschieters, alleen wat ≥2
+camera's zien, onderkant nooit gezien, ruis te laag opgegeven). Beoordeeld op de **99,9%-afwijking** over het
+geziene oppervlak (ongeziene delen apart gerapporteerd):
+
+| Onderdeel (0,5 mm ruis) | Resultaat | 99,9% afwijking |
+|---|---|---|
+| Blok | geslaagd, 6/6 vlakken | 0,06 mm |
+| Gereedschapsblok (3 groeven, T-profiel, kamer, gat) | geslaagd, 23/23 vlakken | 0,22 mm |
+| Beugel met naaf en gat | geslaagd | 0,11 mm |
+| Ondiepe details (2 mm kussen, 3 mm kamer, 3×3 sponning) | nog niet: vlakken goed, sponning wordt soms afschuining | 1,2–3 mm |
+| Plaatwerk Z-profiel 2 mm | nog niet: dunne randen ±1,5 mm | 1,5 mm |
+| Schuin vlak, schuin gat, verzinkboring | nog niet | 4–9 mm |
+
+Een diep gat dat geen camera kan inkijken wordt dichtgemaakt (niet te meten) en apart gemeld.
 
 ## Gauntlet (zelftest)
 

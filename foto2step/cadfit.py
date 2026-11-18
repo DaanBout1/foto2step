@@ -208,7 +208,9 @@ def segment_primitives(P, N, noise_mm, min_pts=None, max_prims=60, seed=0, cylin
                 cs = (signed_cos(c, P[free][ok], N[free][ok]) if oriented
                       else np.abs(np.sum(prim_normals(c, P[free][ok]) * N[free][ok], axis=1)))
                 idx = free[ok][cs > cos_t]
-                idx = _largest_component(P, idx, link, min_size=min_pts if c["type"] == "plane" else None)
+                # refit on the connected region only: letting distant strips join during the
+                # iterations makes a plane tilt to bridge e.g. a pad top and a pocket floor
+                idx = _largest_component(P, idx, link)
                 if len(idx) < min_pts:
                     break
                 if c["type"] == "plane":
@@ -228,6 +230,10 @@ def segment_primitives(P, N, noise_mm, min_pts=None, max_prims=60, seed=0, cylin
                     continue
                 # model selection: a cylinder must fit clearly better than a plane, close to the noise,
                 # and its arc must be evenly covered (not two flat walls of a channel)
+                # the curvature must be clearly measurable: sagitta over the covered arc >= 3 x noise,
+                # otherwise a flat face (plus a bit of a neighbour) passes as a large-radius arc
+                if c["r"] * (1 - np.cos(min(span, np.pi) / 2)) < 3.0 * max(noise_mm, 0.2):
+                    continue
                 rc = np.sqrt(np.mean(prim_dist(c, P[idx]) ** 2))
                 rp = np.sqrt(np.mean(plane_dist(fit_plane(P[idx]), P[idx]) ** 2))
                 if rc > 1.8 * max(noise_mm, 0.2) or rp < 1.3 * rc:
@@ -245,6 +251,15 @@ def segment_primitives(P, N, noise_mm, min_pts=None, max_prims=60, seed=0, cylin
                 break
             continue
         fails = 0
+        if best["type"] == "plane":
+            # converged: now also take the other strips of the same plane (split by grooves etc.)
+            d = np.abs(prim_dist(best, P[free]))
+            ok = d < eps
+            cs = (signed_cos(dict(best), P[free][ok], N[free][ok]) if oriented
+                  else np.abs(np.sum(prim_normals(best, P[free][ok]) * N[free][ok], axis=1)))
+            more = _largest_component(P, free[ok][cs > cos_t], link, min_size=min_pts)
+            if len(more) > len(best_idx):
+                best_idx = np.union1d(best_idx, more)
         if oriented:
             signed_cos(best, P[best_idx], N[best_idx])
         r = np.abs(prim_dist(best, P[best_idx]))
@@ -1471,6 +1486,35 @@ def prune_redundant(prims, labels, P, noise_mm, frac=0.75, small=0.08):
     return [prims[k] for k in alive], labels
 
 
+def _frame_from_planes(planes, w, tol_deg=10.0):
+    """Orthogonal frame best fitting all plane normals that lie near one of its axes (weighted
+    orthogonal Procrustes, iterated). Start: largest plane + the largest one perpendicular to it."""
+    if len(planes) < 2:
+        return None
+    order = np.argsort(-w)
+    e1 = planes[order[0]][1]["n"].copy()
+    e2 = None
+    for o in order[1:]:
+        n = planes[o][1]["n"]
+        if abs(n @ e1) < np.sin(np.radians(10)):
+            e2 = _unit(n - (n @ e1) * e1)
+            break
+    if e2 is None:
+        return None
+    R = np.array([e1, e2, np.cross(e1, e2)])
+    for _ in range(5):
+        A = np.zeros((3, 3))
+        for (k, p), wk in zip(planes, w):
+            c = R @ p["n"]
+            i = int(np.argmax(np.abs(c)))
+            if abs(c[i]) >= np.cos(np.radians(tol_deg)):
+                A += wk * np.outer(np.sign(c[i]) * p["n"], np.eye(3)[i])
+        U, _, Vt = np.linalg.svd(A)
+        D = np.diag([1, 1, np.sign(np.linalg.det(U @ Vt))])
+        R = (U @ D @ Vt).T
+    return R
+
+
 def regularize_orientations(prims, labels, P, tol_deg=4.0, noise_mm=None, up=None):
     """Machined parts are mostly built on one orthogonal frame: snap plane normals and cylinder axes
     that are within tol_deg of a frame axis exactly onto it, then refit offsets / radii. Removes the
@@ -1480,7 +1524,16 @@ def regularize_orientations(prims, labels, P, tol_deg=4.0, noise_mm=None, up=Non
         return prims
     w = np.array([p["n_pts"] if "n_pts" in p else (labels == k).sum() for k, p in planes], float)
     order = np.argsort(-w)
-    if up is not None:
+    R_data = _frame_from_planes(planes, w)
+    if up is not None and R_data is not None:
+        # use the floor only when the part really stands square on it (a part lying on a bent sheet
+        # of paper is a few degrees off; forcing the floor axis would tilt every side face)
+        upn = _unit(np.asarray(up, float))
+        if np.max(np.abs(R_data @ upn)) < np.cos(np.radians(1.5)):
+            up = None
+    if up is None and R_data is not None:
+        e1, e2, e3 = R_data
+    elif up is not None:
         # the floor fixes one axis exactly; the other two come from the dominant vertical planes,
         # averaged (modulo 90 deg) over all of them, weighted by size
         e3 = _unit(np.asarray(up, float))
@@ -1498,16 +1551,7 @@ def regularize_orientations(prims, labels, P, tol_deg=4.0, noise_mm=None, up=Non
         e1 = np.cos(th) * u0 + np.sin(th) * v0
         e2 = np.cross(e3, e1)
     else:
-        e1 = planes[order[0]][1]["n"].copy()
-        e2 = None
-        for o in order[1:]:
-            n = planes[o][1]["n"]
-            if abs(n @ e1) < np.sin(np.radians(10)):
-                e2 = _unit(n - (n @ e1) * e1)
-                break
-        if e2 is None:
-            return prims
-        e3 = np.cross(e1, e2)
+        return prims
     R = np.array([e1, e2, e3])
     out = []
     for k, p in enumerate(prims):
@@ -1574,10 +1618,11 @@ def hoppe_occupancy(P, Nrm, floor_z=None, k=24):
 # 5. driver
 # ----------------------------------------------------------------------------------------------
 
-def reconstruct(P, cams, noise_mm, floor_z=0.0, normals=None, voxel=None, log_fn=log):
+def reconstruct(P, cams, noise_mm, floor_z=0.0, normals=None, voxel=None, log_fn=log, smooth=0.3):
     """Scan points of one part (+ camera centres) -> (solid, info). Cell-complex method."""
     import open3d as o3d
     from .meshing import orient_by_visibility
+    o3d.utility.random.seed(0)  # RANSAC inside open3d: reproducible results
     t0 = time.time()
     pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(np.asarray(P, float)))
     pc, _ = pc.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.5)
@@ -1612,15 +1657,65 @@ def reconstruct(P, cams, noise_mm, floor_z=0.0, normals=None, voxel=None, log_fn
     hyp = thickness_hypotheses(prims, lab, Ps, floor_z=floor_z)
     if hyp:
         log_fn(f"  CAD: {len(hyp)} verborgen achtervlak(ken) voorgesteld uit gemeten wanddikte(s)")
+    bnd = boundary_hypotheses(prims, lab, Ps, Ns, noise_mm)
+    if bnd:
+        log_fn(f"  CAD: {len(bnd)} randwand(en) voorgesteld bij kleine treden")
+    hyp = hyp + bnd
     reconstruct.last = dict(prims=prims, lab=lab, P=Ps, N=Ns, hyp=hyp)
     prims = prims + hyp
     occ = hoppe_occupancy(Pd, Nd, floor_z=floor_z)
-    shape, rep = cell_solid(prims, Pd, occ, floor_z=floor_z, noise_mm=noise_mm)
+    shape, rep = cell_solid(prims, Pd, occ, floor_z=floor_z, noise_mm=noise_mm, smooth=smooth)
     shape = clean_solid(shape)
     info = {"surfaces": len(prims), "cells": rep["cells"], "inside": rep["inside"],
             "ambiguous": rep["ambiguous_cells"], "oriented": dec, "explained": float(np.mean(lab >= 0)),
             "t": time.time() - t0}
     return shape, info
+
+
+def boundary_hypotheses(prims, labels, P, N, noise_mm, max_new=40):
+    """Small steps (a 2 mm pad, a 3 mm pocket, a notch) have walls too low to be segmented on their own.
+    Where a frame-aligned plane region ends, propose a perpendicular, frame-aligned wall at that edge;
+    its position is refined on the few wall points there. The cell selection decides whether it exists."""
+    eps = max(2.5 * noise_mm, 0.8)
+    axes = []
+    for p in prims:
+        if p["type"] == "plane" and p.get("snapped"):
+            if not any(abs(p["n"] @ a) > 0.999 for a in axes):
+                axes.append(p["n"] / np.linalg.norm(p["n"]))
+    if len(axes) < 2:
+        return []
+    existing = [(p["n"], -p["d"]) for p in prims if p["type"] == "plane"]
+    tree = cKDTree(P)
+    out = []
+    for k, p in enumerate(prims):
+        if p["type"] != "plane" or not p.get("snapped"):
+            continue
+        Q = P[labels == k]
+        if len(Q) < 30:
+            continue
+        for e in axes:
+            if abs(e @ p["n"]) > 0.1:
+                continue
+            t = Q @ e
+            for pos in (np.percentile(t, 0.5), np.percentile(t, 99.5)):
+                if any(abs(n @ e) > 0.999 and abs(off * np.sign(n @ e) - pos) < 1.5 for n, off in existing):
+                    continue
+                # refine on points near the candidate wall with a compatible normal
+                near = np.asarray(tree.query_ball_point(Q[np.argmin(np.abs(t - pos))], 40.0))
+                if len(near) == 0:
+                    continue
+                Rn = P[near]
+                dd = Rn @ e - pos
+                sel = (np.abs(dd) < eps) & (np.abs(N[near] @ e) > 0.7)
+                if sel.sum() >= 8:
+                    pos = float(np.median(Rn[sel] @ e))
+                q = {"type": "plane", "n": e.copy(), "d": -pos, "hyp": True, "snapped": True,
+                     "rms": 0.0, "n_pts": int(sel.sum())}
+                existing.append((e, pos))
+                out.append(q)
+                if len(out) >= max_new:
+                    return out
+    return out
 
 
 def thickness_hypotheses(prims, labels, P, max_t=6.0, max_new=12, floor_z=None):
@@ -1754,6 +1849,14 @@ def clean_solid(shape):
             best, bv = so, abs(g.Mass())
     if best is None:
         return shape
+    # closed internal cavities can never be seen by a camera: they are noise -> keep the outer shell
+    from OCP.BRepClass3d import BRepClass3d
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeSolid
+    outer = BRepClass3d.OuterShell_s(best)
+    if not outer.IsNull():
+        ms = BRepBuilderAPI_MakeSolid(outer)
+        if ms.IsDone():
+            best = ms.Solid()
     fx = ShapeFix_Shape(best)
     fx.Perform()
     s = fx.Shape()
@@ -1773,6 +1876,40 @@ def quality(shape, P, noise_mm, floor_z=None):
               and rep["dev_median"] <= max(1.0, 2.0 * noise_mm))
     rep["accepted"] = ok
     return rep
+
+
+def roundtrip_ok(path, shape, vol_tol=0.005):
+    """Read a written STEP back and compare: must be a valid solid with the same volume and no face
+    larger than the part (a face whose boundary got lost on export becomes a huge sheet)."""
+    from OCP.STEPControl import STEPControl_Reader
+    from OCP.BRepCheck import BRepCheck_Analyzer
+    from OCP.GProp import GProp_GProps
+    from OCP.BRepGProp import BRepGProp
+    from OCP.Bnd import Bnd_Box
+    from OCP.BRepBndLib import BRepBndLib
+    r = STEPControl_Reader()
+    if r.ReadFile(str(path)) != 1:
+        return False, "niet leesbaar"
+    r.TransferRoots()
+    rs = r.OneShape()
+    if not BRepCheck_Analyzer(rs).IsValid():
+        return False, "teruggelezen STEP ongeldig"
+    def vol(x):
+        g = GProp_GProps()
+        BRepGProp.VolumeProperties_s(x, g)
+        return g.Mass()
+    v0, v1 = vol(shape), vol(rs)
+    if abs(v1 - v0) > vol_tol * abs(v0):
+        return False, f"volume na teruglezen {v1:.0f} i.p.v. {v0:.0f} mm3"
+    b0 = Bnd_Box()
+    BRepBndLib.Add_s(shape, b0, False)
+    ext0 = b0.CornerMax().Distance(b0.CornerMin())
+    for f in _faces_of(rs):
+        b = Bnd_Box()
+        BRepBndLib.Add_s(f, b, False)
+        if b.CornerMax().Distance(b.CornerMin()) > 1.5 * ext0:
+            return False, "vlak verloor zijn begrenzing bij export"
+    return True, "ok"
 
 
 def write_named_step(path, parts, assembly_name=None):
