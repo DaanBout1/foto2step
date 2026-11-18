@@ -154,9 +154,9 @@ def write_report(work: Path, out: Path, cfg: dict, states: list):
           "<th>Punten verklaard</th></tr>")
         for p in cads:
             c = p["cad"]
-            res = ("<b>CAD-solid gebruikt</b>" if c.get("accepted") else
+            res = (f"<b>CAD-solid gebruikt</b> ({html.escape(str(c.get('geometry', '')))})" if c.get("accepted") else
                    f"<span class=warn>mesh gebruikt</span> ({html.escape(str(c.get('reason', '')))})")
-            dev = (f"{_r(c['dev_median'])} / {_r(c['dev_p95'])} mm" if "dev_median" in c else "-")
+            dev = (f"{_r(c['dev_median'])} / {_r(c.get('dev_p98', c.get('dev_p95', 0)))} mm (98%)" if "dev_median" in c else "-")
             a(f"<tr><td>{html.escape(p['name'])}</td><td>{res}</td><td>{c.get('faces', '-')}</td>"
               f"<td>{c.get('surfaces', '-')}</td><td>{dev}</td><td>{c.get('explained', 0) * 100:.0f}%</td></tr>")
         a("</table><p>De CAD-solid bestaat uit echte vlakken en cilinders, gefit op duizenden meetpunten: de ruis middelt "

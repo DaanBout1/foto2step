@@ -34,10 +34,32 @@ def _unit(v):
     return v / (np.linalg.norm(v, axis=-1, keepdims=True) + 1e-12)
 
 
-def fit_plane(P):
+def fit_plane(P, robust_sigma=None, init=None):
+    """Least-squares plane; with robust_sigma an IRLS fit with Tukey weights (c = 2.5 sigma), started
+    from `init` when given, so a second nearby level (a 2 mm step) cannot tilt the plane."""
     c = P.mean(0)
     _, _, vt = np.linalg.svd(P - c, full_matrices=False)
     n = vt[2]
+    if robust_sigma and len(P) > 10:
+        if init is not None:
+            n = init["n"] / np.linalg.norm(init["n"])
+            c = P[np.argsort(np.abs(P @ n + init["d"]))[: max(10, len(P) // 2)]].mean(0)
+        cc = 2.5 * robust_sigma
+        for _ in range(15):
+            r = (P - c) @ n
+            r = r - np.median(r)
+            u = r / cc
+            w = np.where(np.abs(u) < 1, (1 - u * u) ** 2, 0.0)
+            if w.sum() < 10:
+                break
+            c = (w[:, None] * P).sum(0) / w.sum()
+            X = (P - c) * np.sqrt(w)[:, None]
+            _, _, vt = np.linalg.svd(X, full_matrices=False)
+            n_new = vt[2] * np.sign(vt[2] @ n)
+            if np.linalg.norm(n_new - n) < 1e-7:
+                n = n_new
+                break
+            n = n_new
     return {"type": "plane", "n": n, "d": -float(n @ c), "c": c}
 
 
@@ -1213,8 +1235,79 @@ def reference_volume(P, Nrm, floor_z=None, depth=9):
     return occ, m
 
 
-def cell_solid(prims, P, occ, floor_z=None, margin=0.3, grid=0.6, min_frac=0.5, max_cells=20000, smooth=0.3,
-               noise_mm=0.5):
+def _edge_position(t, noise_mm, bin_w=0.2):
+    """Where a point cloud ends along a direction, for a side that no fitted surface bounds (the
+    2 mm end face of a sheet: too narrow for normals and segmentation). t: coordinates, the edge is
+    at the high end. Model of the density near the edge: a blurred step (faces running up to the
+    edge) + a Gaussian bump of width noise (the end face itself, seen edge-on) + a constant
+    (outliers). A step's midpoint is unbiased whatever its blur, unlike the extreme percentile,
+    which lies ~3 noise outside. Returns None when the fit is not convincing."""
+    from scipy.special import ndtr
+    q = np.percentile(t, 99.9)
+    lo_, hi_ = q - 12.0, q + 3.0
+    tt = t[(t > lo_) & (t < hi_)]
+    if len(tt) < 200:
+        return None
+    edges = np.arange(lo_, hi_ + bin_w, bin_w)
+    h, _ = np.histogram(tt, edges)
+    x = 0.5 * (edges[:-1] + edges[1:])
+    sig = max(noise_mm, 0.1)
+    best = None
+    for st in (0.3 * sig, 0.6 * sig, sig):
+        for e in np.arange(q - 4 * sig, q + 1.0, 0.02):
+            M = np.c_[ndtr((e - x) / st), np.exp(-0.5 * ((x - e) / sig) ** 2), np.ones_like(x)]
+            c, *_ = np.linalg.lstsq(M, h, rcond=None)
+            if c[0] <= 0 or c[1] < 0 or c[2] < 0:
+                continue
+            r = float(np.sum((M @ c - h) ** 2))
+            if best is None or r < best[0]:
+                best = (r, e, c)
+    if best is None:
+        return None
+    r, e, c = best
+    plateau = c[0]
+    if plateau < 3 * max(c[2], 0.5):  # no clear step above the background
+        return None
+    return float(e)
+
+
+def _tight_box(P, prims, noise_mm, margin):
+    """Bounding box of the cell complex. Sides bounded by a fitted surface facing that way stay at
+    the robust extent + margin (the surface cuts the part off inside it). A side where the extreme
+    points lie only on surfaces running along it (sheet edges) is put at the estimated edge: the box
+    face is then the part's face."""
+    lo = np.percentile(P, 0.02, axis=0) - margin
+    hi = np.percentile(P, 99.98, axis=0) + margin
+    eps = max(2.5 * noise_mm, 0.8)
+    for ax in range(3):
+        for sgn in (1.0, -1.0):
+            t = sgn * P[:, ax]
+            q = np.percentile(t, 99.9)
+            S = P[t > q - 2.0]
+            d = np.zeros(3)
+            d[ax] = sgn
+            facing = np.zeros(len(S), bool)
+            for pr in prims:
+                if pr.get("hyp"):
+                    continue
+                near = np.abs(prim_dist(pr, S)) < eps
+                if near.any():
+                    nn = prim_normals(pr, S[near])
+                    facing[np.where(near)[0][np.abs(nn @ d) > np.cos(np.radians(30))]] = True
+            if facing.mean() > 0.2:
+                continue
+            e = _edge_position(t, noise_mm)
+            if e is None:
+                continue
+            if sgn > 0:
+                hi[ax] = min(hi[ax], e)
+            else:
+                lo[ax] = max(lo[ax], -e)
+    return lo, hi
+
+
+def cell_solid(prims, P, occ, floor_z=None, margin=0.3, grid=0.6, min_frac=0.5, max_cells=60000, smooth=0.3,
+               noise_mm=0.5, floor_plane=None, N=None, cams=None):
     """Cell complex of the bounding box split by every fitted surface; keep inside cells; return the
     boundary as one solid. Returns (shape, report)."""
     import open3d as o3d
@@ -1226,10 +1319,11 @@ def cell_solid(prims, P, occ, floor_z=None, margin=0.3, grid=0.6, min_frac=0.5, 
     from OCP.TopoDS import TopoDS
     # tight box at the robust data extent: where no fitted surface bounds the part (narrow sheet
     # edges that got too few points) the box face is the best estimate, so it must not sit mm outside
-    lo = np.percentile(P, 0.02, axis=0) - margin
-    hi = np.percentile(P, 99.98, axis=0) + margin
+    lo, hi = _tight_box(P, [p for p in prims], noise_mm, margin)
     if floor_z is not None:
         lo[2] = floor_z
+        if floor_plane is not None:  # a tilted bottom may dip a little under the floor level
+            lo[2] = min(lo[2], float(np.percentile(P[:, 2], 0.02)) - margin)
     box = BRepPrimAPI_MakeBox(gp_Pnt(*lo), gp_Pnt(*hi)).Shape()
     mv = BOPAlgo_MakerVolume()
     mv.AddArgument(box)
@@ -1291,16 +1385,66 @@ def cell_solid(prims, P, occ, floor_z=None, margin=0.3, grid=0.6, min_frac=0.5, 
     vol = np.array(vols)
     if smooth > 0 and len(cells) > 1:
         keep = _graphcut_cells(cells, fr, vol, smooth, P=P, eps=max(1.0, 2.5 * noise_mm),
-                               floor_z=floor_z, prims=prims)
+                               floor_z=floor_z, prims=prims, floor_plane=floor_plane,
+                               vis=_visibility_test(P, N, cams) if cams is not None and N is not None else None)
     chosen = [c for c, k in zip(cells, keep) if k]
+    cell_solid.last_chosen = chosen
+    cell_solid.debug = (cells, fr, vol, keep)
+    from OCP.GProp import GProp_GProps as _GP
+    from OCP.BRepGProp import BRepGProp as _BG
+    vsum = 0.0
+    for c in chosen:
+        g = _GP()
+        _BG.VolumeProperties_s(c, g)
+        vsum += abs(g.Mass())
     shape = _boundary_solid(chosen)
-    rep = {"surfaces": len(prims), "cells": len(cells), "inside": len(chosen),
+    rep = {"surfaces": len(prims), "cells": len(cells), "inside": len(chosen), "cells_volume": vsum,
            "ambiguous_cells": int(((fr > 0.2) & (fr < 0.8)).sum())}
     return shape, rep
 
 
+def _visibility_test(P, N, cams, min_cams=2, max_cams=64, splat_factor=2.0, ignore_mm=4.0):
+    """vis(S) -> bool per sample: is the spot in the line of sight of >= min_cams cameras, with the
+    scan points (as small discs) as occluders? Used to tell 'no points because it does not exist'
+    from 'no points because no camera could see it'. Occluders closer than ignore_mm do not count:
+    they belong to the surface the cell selection is deciding about (a 1 mm sliver behind a wall
+    is hidden by that wall only as long as the sliver is kept)."""
+    import open3d as o3d
+    P = np.asarray(P, float)
+    N = np.asarray(N, float)
+    C = np.asarray(cams, float)
+    if len(C) > max_cams:
+        C = C[np.linspace(0, len(C) - 1, max_cams).astype(int)]
+    d, _ = cKDTree(P).query(P[:: max(1, len(P) // 20000)], k=2)
+    sp = float(np.clip(splat_factor * np.median(d[:, 1]), 0.4, 3.0))
+    t1 = np.cross(N, np.where(np.abs(N[:, :1]) < 0.9, [[1.0, 0, 0]], [[0, 1.0, 0]]))
+    t1 /= np.maximum(np.linalg.norm(t1, axis=1, keepdims=True), 1e-12)
+    t2 = np.cross(N, t1)
+    V = np.concatenate([P + sp * (np.cos(a) * t1 + np.sin(a) * t2) for a in np.radians([90.0, 210.0, 330.0])])
+    n = len(P)
+    F = np.c_[np.arange(n), np.arange(n) + n, np.arange(n) + 2 * n]
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.core.Tensor(V.astype(np.float32)), o3d.core.Tensor(F.astype(np.uint32)))
+    off = float(ignore_mm)
+
+    def vis(S, chunk=20000):
+        S = np.asarray(S, float)
+        out = np.zeros(len(S), bool)
+        for i in range(0, len(S), chunk):
+            Q = S[i:i + chunk]
+            D = C[None] - Q[:, None]
+            L = np.linalg.norm(D, axis=2)
+            U = D / L[..., None]
+            O = Q[:, None] + off * U
+            rays = np.concatenate([O.reshape(-1, 3), U.reshape(-1, 3)], 1).astype(np.float32)
+            hit = scene.cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy().reshape(len(Q), len(C))
+            out[i:i + chunk] = (hit >= L - off - 0.5).sum(1) >= min_cams
+        return out
+    return vis
+
+
 def _graphcut_cells(cells, frac, vol, lam, P=None, eps=1.0, step=1.0, w_unsup=4.0, floor_z=None,
-                    prims=None, w_orient=5.0):
+                    prims=None, w_orient=5.0, floor_plane=None, vis=None):
     """Binary labelling of cells by exact min-cut.
     unary: volume that disagrees with the reference occupancy;
     pairwise: every face that would become part of the model surface (between an inside and an outside
@@ -1321,11 +1465,20 @@ def _graphcut_cells(cells, frac, vol, lam, P=None, eps=1.0, step=1.0, w_unsup=4.
                 S, a = _sample_face(f, step)
                 farea[h] = a
                 face_pts[h] = S
-                if floor_z is not None and len(S) and np.all(np.abs(S[:, 2] - floor_z) < 0.05):
+                if floor_plane is not None:
+                    on_floor = len(S) and np.all(np.abs(S @ floor_plane[0] - floor_plane[1]) < 0.05)
+                else:
+                    on_floor = floor_z is not None and len(S) and np.all(np.abs(S[:, 2] - floor_z) < 0.05)
+                if on_floor:
                     fsup[h] = 1.0  # the underside on the floor is never seen: no penalty
                 elif tree is not None and len(S):
                     d, _ = tree.query(S, distance_upper_bound=eps)
-                    fsup[h] = float(np.isfinite(d).mean())
+                    uns = ~np.isfinite(d)
+                    if vis is not None and uns.any():
+                        # only a face the cameras could have seen is suspicious when it has no
+                        # points; the deep part of a hole is hidden by its own rim
+                        uns[np.where(uns)[0][~vis(S[uns])]] = False
+                    fsup[h] = float(1.0 - uns.mean())
                 else:
                     fsup[h] = 1.0
     G = nx.DiGraph()
@@ -1372,10 +1525,37 @@ def _graphcut_cells(cells, frac, vol, lam, P=None, eps=1.0, step=1.0, w_unsup=4.
         G.add_edge("s", i, capacity=float(unary_out[i]))  # cut when i is outside
         G.add_edge(i, "t", capacity=float(unary_in[i]))   # cut when i is inside
     _, (S, _) = nx.minimum_cut(G, "s", "t")
+    _graphcut_cells.debug = dict(owner=owner, farea=farea, fsup=fsup, unary_in=unary_in, unary_out=unary_out)
     return [i in S for i in range(len(cells))]
 
 
 def _boundary_solid(cells):
+    """Union of the chosen cells by a glued boolean fuse (cells share faces exactly, so the 'full glue'
+    option is exact and fast). Proper topology: sewing the boundary faces instead produced solids that
+    BRepCheck accepted but that broke on STEP export (real scan)."""
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
+    from OCP.OCP.collections import List_TopoDS_Shape
+    from OCP.BOPAlgo import BOPAlgo_GlueFull
+    if not cells:
+        raise RuntimeError("geen gesloten solid: geen enkele cel als binnen geclassificeerd")
+    if len(cells) == 1:
+        return cells[0]
+    a, t = List_TopoDS_Shape(), List_TopoDS_Shape()
+    a.Append(cells[0])
+    for c in cells[1:]:
+        t.Append(c)
+    f = BRepAlgoAPI_Fuse()
+    f.SetArguments(a)
+    f.SetTools(t)
+    f.SetGlue(BOPAlgo_GlueFull)
+    f.SetRunParallel(True)
+    f.Build()
+    if not f.IsDone():
+        return _boundary_solid_sewn(cells)
+    return f.Shape()
+
+
+def _boundary_solid_sewn(cells):
     """Faces used by exactly one chosen cell form the outer boundary; sew -> solid -> merge coplanar."""
     from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing, BRepBuilderAPI_MakeSolid
     from OCP.ShapeFix import ShapeFix_Solid
@@ -1444,7 +1624,16 @@ def refine_primitives(prims, labels, P, N, noise_mm, iters=4, oriented=False):
                 break
             Qi = Q[inl]
             if p["type"] == "plane":
-                p["d"] = -float(np.mean(Qi @ p["n"]))
+                if p.get("snapped"):
+                    p["d"] = -float(np.mean(Qi @ p["n"]))
+                else:
+                    sg = p.get("s")
+                    fp = fit_plane(Qi, robust_sigma=noise_mm, init=p)
+                    if fp["n"] @ p["n"] < 0:
+                        fp["n"], fp["d"] = -fp["n"], -fp["d"]
+                    p["n"], p["d"] = fp["n"], fp["d"]
+                    if sg is not None:
+                        p["s"] = sg
             else:
                 a = p["a"]
                 u, v = _perp_basis(a)
@@ -1458,7 +1647,101 @@ def refine_primitives(prims, labels, P, N, noise_mm, iters=4, oriented=False):
     return prims
 
 
-def prune_redundant(prims, labels, P, noise_mm, frac=0.75, small=0.08):
+def dedupe_surfaces(prims, tol=None, noise_mm=0.5):
+    """Parallel planes (or coaxial equal cylinders) closer than tol create sliver cells that can split
+    the solid into pieces. Keep the best-supported one of each such group (measured surfaces before
+    hypotheses)."""
+    tol = tol if tol is not None else max(0.3, 1.0 * noise_mm)
+    order = sorted(range(len(prims)), key=lambda k: (prims[k].get("hyp", False), -prims[k].get("n_pts", 0)))
+    kept = []
+    for k in order:
+        p = prims[k]
+        dup = False
+        for j in kept:
+            q = prims[j]
+            if p["type"] != q["type"]:
+                continue
+            if p["type"] == "plane":
+                c = p["n"] @ q["n"]
+                if abs(c) > np.cos(np.radians(1.0)) and abs(-p["d"] - np.sign(c) * -q["d"]) < tol:
+                    dup = True
+            else:
+                if (abs(p["a"] @ q["a"]) > np.cos(np.radians(1.0)) and abs(p["r"] - q["r"]) < tol and
+                        np.linalg.norm(np.cross(p["p"] - q["p"], q["a"])) < tol):
+                    dup = True
+            if dup:
+                break
+        if not dup:
+            kept.append(k)
+    return [prims[k] for k in sorted(kept)]
+
+
+def drop_ghost_layers(prims, labels, P, max_gap=5.0, cell=3.0, overlap=0.6, noise_mm=0.25):
+    """Reflections on shiny metal give a second, parallel copy of a face a few mm off. An opaque
+    surface cannot be seen at two levels in the same spot (a real pad or pocket hides the level
+    under it), so a same-facing parallel plane whose footprint lies on a larger plane's footprint is
+    dropped; its points become unlabelled."""
+    planes = [k for k, p in enumerate(prims) if p["type"] == "plane"]
+    size = {k: int((labels == k).sum()) for k in planes}
+    dead = set()
+    drop_ghost_layers.debug = []
+    def foot(k, u, v, dense=False):
+        Q = P[labels == k]
+        ij = np.floor(np.c_[Q @ u, Q @ v] / cell).astype(int)
+        cells, cnt = np.unique(ij, axis=0, return_counts=True)
+        if dense:  # only where the surface was really measured, not a few stray noisy points
+            cells = cells[cnt >= max(3, 0.5 * np.median(cnt))]
+        return set(map(tuple, cells))
+    for a in sorted(planes, key=lambda k: -size[k]):
+        if a in dead:
+            continue
+        pa = prims[a]
+        u, v = _perp_basis(pa["n"])
+        Fa = None
+        for b in planes:
+            if b == a or b in dead or size[b] > size[a]:
+                continue
+            pb = prims[b]
+            if abs(pa["n"] @ pb["n"]) < np.cos(np.radians(5)):
+                continue
+            if pa.get("s", 1) * pb.get("s", 1) * (pa["n"] @ pb["n"]) < 0:
+                continue  # facing the other way: other side of a wall, not a ghost
+            gap = abs(np.median(prim_dist(pa, P[labels == b])))
+            if not (max(0.5, 2.0 * noise_mm) < gap < max_gap):  # closer: same surface, split by noise
+                continue
+            Fa = Fa if Fa is not None else foot(a, u, v, dense=True)
+            Fb = foot(b, u, v)
+            if Fb and len(Fb & Fa) / len(Fb) >= overlap:
+                drop_ghost_layers.debug.append((a, b, round(gap, 2), size[a], size[b], round(len(Fb & Fa) / len(Fb), 2)))
+                dead.add(b)
+    drop_ghost_layers.ghost_mask = np.zeros(len(P), bool)
+    if not dead:
+        return prims, labels
+    # all points of the ghost layer go, also unlabelled ones near it: they would otherwise make the
+    # occupancy test see a surface that is not there
+    for b in dead:
+        pb = prims[b]
+        a = [a_ for a_, b_, *_ in drop_ghost_layers.debug if b_ == b][0]
+        u, v = _perp_basis(prims[a]["n"])
+        # the reflection can lie over the whole real face, while RANSAC may have given only part of
+        # it to the ghost plane (the rest is unlabelled or sits on walls at the rim): use the real
+        # face's footprint. The gap is > 0.5 mm * 2, so a band of half the gap keeps the real points.
+        Fa = foot(a, u, v)
+        gap_b = abs(np.median(prim_dist(prims[a], P[labels == b])))
+        band = np.abs(prim_dist(pb, P)) < 0.5 * gap_b
+        ij = np.floor(np.c_[P @ u, P @ v] / cell).astype(int)
+        Fd = {(i + di, j + dj) for i, j in Fa for di in (-1, 0, 1) for dj in (-1, 0, 1)}
+        inside = np.array([tuple(x) in Fd for x in ij])
+        drop_ghost_layers.ghost_mask |= band & inside
+    keep = [k for k in range(len(prims)) if k not in dead]
+    remap = -np.ones(len(prims) + 1, int)
+    remap[keep] = np.arange(len(keep))
+    labels = np.where(labels >= 0, remap[labels], -1)
+    log(f"  CAD: {len(dead)} spiegel-/dubbellaag(en) verwijderd")
+    return [prims[k] for k in keep], labels
+
+
+def prune_redundant(prims, labels, P, noise_mm, frac=0.75, small=0.5, N=None):
     """Drop small primitives whose points are already explained (by distance) by other primitives:
     strips along an edge where the noise made neither neighbour claim the points. They would add
     false cuts and faces. Points are handed to the nearest remaining primitive."""
@@ -1476,10 +1759,25 @@ def prune_redundant(prims, labels, P, noise_mm, frac=0.75, small=0.08):
         if not others:
             continue
         D = np.stack([np.abs(prim_dist(prims[j], Q)) for j in others], 1)
-        if (D.min(1) < 1.5 * eps).mean() >= frac:
+        if N is not None:
+            # a point only counts as explained by a surface facing the same way
+            NQ = N[labels == k]
+            for c_, j in enumerate(others):
+                cs = np.sum(prim_normals(prims[j], Q) * NQ, axis=1)
+                if "s" not in prims[j]:
+                    cs = np.abs(cs)
+                # 45 deg: at concave edges the PCA normal is a blend of both faces (seen ~37 deg);
+                # perpendicular (90) and opposite (180) faces stay well apart
+                D[cs < np.cos(np.radians(45)), c_] = np.inf
+        best_j = D.argmin(1)
+        expl = D.min(1) < 1.5 * eps
+        # the explaining surface must pass through the points, not run parallel 2 mm away
+        sd = np.array([prim_dist(prims[others[j]], Q[i:i + 1])[0] for i, j in enumerate(best_j)])
+        centred = abs(np.median(sd[expl])) < 0.5 * eps if expl.any() else False
+        if expl.mean() >= frac and centred:
             alive.remove(k)
             idx = np.where(labels == k)[0]
-            labels[idx] = np.array(others)[D.argmin(1)]
+            labels[idx] = np.where(expl, np.array(others)[best_j], -1)
     remap = -np.ones(len(prims) + 1, int)
     remap[alive] = np.arange(len(alive))
     labels = np.where(labels >= 0, remap[labels], -1)
@@ -1531,6 +1829,7 @@ def regularize_orientations(prims, labels, P, tol_deg=4.0, noise_mm=None, up=Non
         upn = _unit(np.asarray(up, float))
         if np.max(np.abs(R_data @ upn)) < np.cos(np.radians(1.5)):
             up = None
+    regularize_orientations.frame_from_floor = up is not None
     if up is None and R_data is not None:
         e1, e2, e3 = R_data
     elif up is not None:
@@ -1567,6 +1866,16 @@ def regularize_orientations(prims, labels, P, tol_deg=4.0, noise_mm=None, up=Non
         if p["type"] == "plane":
             c = R @ p["n"]
             i = int(np.argmax(np.abs(c)))
+            if abs(c[i]) < cos_t and abs(c[i]) >= np.cos(np.radians(12)) and len(Q) > 10:
+                # model selection instead of a hard angle: on a thick noisy layer (reflections) a free
+                # fit tilts by several degrees; snap when the frame-aligned plane explains the points
+                # just as well
+                n_s = np.sign(c[i]) * R[i]
+                d_s = -float(np.median(Q @ n_s))
+                r_t = np.sqrt(np.mean(plane_dist(p, Q) ** 2))
+                r_s = np.sqrt(np.mean((Q @ n_s + d_s) ** 2))
+                if r_s <= 1.10 * r_t + 0.1 * (noise_mm or 0.5):
+                    cos_t = -1.0
             if abs(c[i]) >= cos_t:
                 n = np.sign(c[i]) * R[i]
                 p["n"] = n
@@ -1595,7 +1904,7 @@ def regularize_orientations(prims, labels, P, tol_deg=4.0, noise_mm=None, up=Non
     return out
 
 
-def hoppe_occupancy(P, Nrm, floor_z=None, k=24):
+def hoppe_occupancy(P, Nrm, floor_z=None, k=24, floor_plane=None):
     """Inside test from oriented scan points (normals pointing outward, towards the cameras):
     a query is inside when it lies behind the local tangent planes of its nearest scan points."""
     tree = cKDTree(P)
@@ -1608,7 +1917,9 @@ def hoppe_occupancy(P, Nrm, floor_z=None, k=24):
             _, j = tree.query(q, k=k)
             s = np.einsum("qkd,qkd->qk", q[:, None, :] - P[j], Nrm[j])
             inside[i:i + chunk] = np.median(s, axis=1) < 0
-        if floor_z is not None:
+        if floor_plane is not None:  # (n, h): the part lies on the side x.n > h
+            inside &= Q @ floor_plane[0] > floor_plane[1]
+        elif floor_z is not None:
             inside &= Q[:, 2] > floor_z
         return inside
     return occ
@@ -1634,27 +1945,64 @@ def reconstruct(P, cams, noise_mm, floor_z=0.0, normals=None, voxel=None, log_fn
     pc = pc.voxel_down_sample(voxel)
     r_n = max(3.0, 5 * voxel)
     dens = len(pc.points) / max(1e-9, _approx_area(np.asarray(pc.points), voxel))
-    pc.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=r_n, max_nn=int(np.clip(4 * np.pi * r_n ** 2 * dens, 40, 400))))
+    def _normals(Pq):
+        if normals is not None:
+            return np.asarray(normals)[cKDTree(np.asarray(P)).query(Pq)[1]], 1.0
+        pq = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(Pq))
+        pq.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(
+            radius=r_n, max_nn=int(np.clip(4 * np.pi * r_n ** 2 * dens, 40, 400))))
+        return orient_by_visibility(Pq, np.asarray(pq.normals), cams)
+
     Pd = np.asarray(pc.points)
-    if normals is not None:
-        Nd = np.asarray(normals)
-        Nd = Nd[cKDTree(np.asarray(P)).query(Pd)[1]]
-        dec = 1.0
-    else:
-        Nd, dec = orient_by_visibility(Pd, np.asarray(pc.normals), cams)
+    Nd, dec = _normals(Pd)
     # all points take part (thin flanges and steps just above the floor too); floor points were cropped
     Ps, Ns = Pd, Nd
     min_pts = max(40, int(25.0 * dens))  # ~25 mm^2 of surface, independent of point density
-    prims, lab = segment_primitives(Ps, Ns, noise_mm, min_pts=min_pts, oriented=True)
-    prims, lab = merge_similar(prims, lab, Ps, noise_mm)
-    prims = regularize_orientations(prims, lab, Ps, noise_mm=noise_mm,
-                                    up=(0, 0, 1.0) if floor_z is not None else None)
-    prims, lab = prune_redundant(prims, lab, Ps, noise_mm)
+    up_axis = (0, 0, 1.0) if floor_z is not None else None
+
+    def _segment(Ps, Ns):
+        prims, lab = segment_primitives(Ps, Ns, noise_mm, min_pts=min_pts, oriented=True)
+        prims, lab = merge_similar(prims, lab, Ps, noise_mm)
+        prims = regularize_orientations(prims, lab, Ps, noise_mm=noise_mm, up=up_axis)
+        return prims, lab
+
+    prims, lab = _segment(Ps, Ns)
+    prims, lab = drop_ghost_layers(prims, lab, Ps, noise_mm=noise_mm)
+    gm = getattr(drop_ghost_layers, "ghost_mask", None)
+    if gm is not None and gm.any():
+        # reflection layer found: remove its points and segment again, so the strips it caused at
+        # the edges disappear as well
+        # (normals again too: near the layer they were estimated from a mix of both levels)
+        Ps = Ps[~gm]
+        Ns, dec = _normals(Ps)
+        Pd, Nd = Ps, Ns  # Pd/Ps are the same set here
+        prims, lab = _segment(Ps, Ns)
+    prims, lab = prune_redundant(prims, lab, Ps, noise_mm, N=Ns)
     prims = refine_primitives(prims, lab, Ps, Ns, noise_mm, oriented=True)
     prims, lab = merge_similar(prims, lab, Ps, noise_mm)  # snapping can make planes coincide
+    prims, lab = split_false_chamfers(prims, lab, Ps, Ns, noise_mm)
+    prims, lab = detail_primitives(prims, lab, Ps, Ns, noise_mm, min_pts)
     log_fn(f"  CAD: {len(prims)} oppervlakken ({sum(p['type'] == 'plane' for p in prims)} vlak, "
            f"{sum(p['type'] == 'cylinder' for p in prims)} cilinder), {np.mean(lab >= 0):.0%} van de punten verklaard")
+    Ns, n_flip = harmonize_normals(prims, lab, Ps, Ns, noise_mm)
+    Pd, Nd = Ps, Ns
     hyp = thickness_hypotheses(prims, lab, Ps, floor_z=floor_z)
+    floor_plane = None  # set only for a tilted part; otherwise the level floor floor_z is used
+    if floor_z is not None and not getattr(regularize_orientations, "frame_from_floor", True):
+        # part stands a little tilted on the floor (bent marker sheet, chip under one edge): its
+        # own underside is square to the part, through its lowest point. It replaces the floor as the
+        # unseen bottom; the floor would leave a wedge of air under the part in the solid.
+        axes = [p_["n"] for p_ in prims if p_["type"] == "plane" and p_.get("snapped")]
+        if axes:
+            a = max(axes, key=lambda n: abs(n[2]))
+            a = a * np.sign(a[2])
+            tilt = np.degrees(np.arccos(min(1.0, abs(a[2]))))
+            if tilt < 6.0:  # more is not "standing a bit crooked" but a part placed on purpose
+                zmin = float(np.percentile(Ps @ a, 0.5))
+                hyp.append({"type": "plane", "n": a.copy(), "d": -zmin, "hyp": True, "snapped": True,
+                            "rms": 0.0, "n_pts": 0})
+                floor_plane = (a.copy(), zmin)
+                log_fn(f"  CAD: deel staat {tilt:.1f}° scheef op de vloer; onderkant haaks op het deel")
     if hyp:
         log_fn(f"  CAD: {len(hyp)} verborgen achtervlak(ken) voorgesteld uit gemeten wanddikte(s)")
     bnd = boundary_hypotheses(prims, lab, Ps, Ns, noise_mm)
@@ -1662,14 +2010,297 @@ def reconstruct(P, cams, noise_mm, floor_z=0.0, normals=None, voxel=None, log_fn
         log_fn(f"  CAD: {len(bnd)} randwand(en) voorgesteld bij kleine treden")
     hyp = hyp + bnd
     reconstruct.last = dict(prims=prims, lab=lab, P=Ps, N=Ns, hyp=hyp)
-    prims = prims + hyp
-    occ = hoppe_occupancy(Pd, Nd, floor_z=floor_z)
-    shape, rep = cell_solid(prims, Pd, occ, floor_z=floor_z, noise_mm=noise_mm, smooth=smooth)
+    prims = dedupe_surfaces(prims + hyp, noise_mm=noise_mm)
+    occ = hoppe_occupancy(Pd, Nd, floor_z=floor_z, floor_plane=floor_plane)
+    shape, rep = cell_solid(prims, Pd, occ, floor_z=floor_z, noise_mm=noise_mm, smooth=smooth,
+                            floor_plane=floor_plane, N=Nd, cams=cams)
     shape = clean_solid(shape)
+    # simplification: a surface that ends up bounding (almost) nothing only adds cells, slivers and
+    # tiny faces. Drop those and solve again on the remaining surfaces.
+    a_min = max(30.0, 10 * (2.5 * noise_mm) ** 2)
+    used = _surface_areas(shape, prims)
+    drop = [k for k in range(len(prims)) if used[k] < a_min]
+    if drop and len(drop) < len(prims):
+        keep_p = [p for k, p in enumerate(prims) if k not in drop]
+        log_fn(f"  CAD: {len(drop)} oppervlak(ken) zonder wezenlijke bijdrage weggelaten, opnieuw opgelost")
+        try:
+            shape2, rep2 = cell_solid(keep_p, Pd, occ, floor_z=floor_z, noise_mm=noise_mm, smooth=smooth,
+                                      floor_plane=floor_plane, N=Nd, cams=cams)
+            shape2 = clean_solid(shape2)
+            q1 = quality(shape, Pd, noise_mm, floor_z)
+            q2 = quality(shape2, Pd, noise_mm, floor_z)
+            # keep the simpler model unless it fits clearly worse
+            if q2["dev_p95"] <= q1["dev_p95"] + 0.25 * noise_mm and q2["frac_far"] <= q1["frac_far"] + 0.01:
+                shape, rep, prims = shape2, rep2, keep_p
+        except Exception as e:  # the first solution stands
+            log_fn(f"  CAD: vereenvoudiging mislukt ({e}); eerste oplossing blijft")
     info = {"surfaces": len(prims), "cells": rep["cells"], "inside": rep["inside"],
             "ambiguous": rep["ambiguous_cells"], "oriented": dec, "explained": float(np.mean(lab >= 0)),
+            "noise_mm": float(noise_mm), "cells_volume": rep.get("cells_volume"),
             "t": time.time() - t0}
     return shape, info
+
+
+def _surface_areas(shape, prims, tol=0.05):
+    """Area of the solid's boundary lying on each primitive."""
+    out = np.zeros(len(prims))
+    for f in _faces_of(shape):
+        S, a = _sample_face(f, 2.0)
+        if len(S) == 0:
+            continue
+        x = S[len(S) // 2][None]
+        d = [abs(prim_dist(p, x)[0]) for p in prims]
+        k = int(np.argmin(d)) if d else -1
+        if k >= 0 and d[k] < tol:
+            out[k] += a
+    return out
+
+
+def _same_surface(p, q, tol):
+    """Two primitives describing the same geometric surface (orientation ignored)."""
+    if p["type"] != q["type"]:
+        return False
+    if p["type"] == "plane":
+        c = p["n"] @ q["n"]
+        return abs(c) > 0.999 and abs(p["d"] - np.sign(c) * q["d"]) < tol
+    if abs(p["a"] @ q["a"]) < 0.999 or abs(p["r"] - q["r"]) > tol:
+        return False
+    w = q["p"] - p["p"]
+    return np.linalg.norm(w - (w @ p["a"]) * p["a"]) < tol
+
+
+def split_false_chamfers(prims, labels, P, N, noise_mm):
+    """A small step (a 3 x 3 mm notch along an edge) at ~0.5 mm noise is also fitted by one slanted
+    plane across it (a false chamfer). For a plane that is not on the part's frame but lies along a
+    frame axis, compare with the frame-aligned step (two planes, each point on the nearer one); the
+    step wins when it fits clearly better and both arms are well populated."""
+    axes = []
+    for p in prims:
+        if p["type"] == "plane" and p.get("snapped"):
+            if not any(abs(p["n"] @ a) > 0.999 for a in axes):
+                axes.append(_unit(p["n"]))
+    if len(axes) < 3:
+        return prims, labels
+    out = list(prims)
+    labels = labels.copy()
+    n_split = 0
+    for k, p in enumerate(prims):
+        if p["type"] != "plane" or p.get("snapped"):
+            continue
+        idx = np.where(labels == k)[0]
+        if len(idx) < 60:
+            continue
+        along = [a for a in axes if abs(a @ p["n"]) < np.sin(np.radians(2))]
+        if len(along) != 1:
+            continue
+        a1, a2 = [a for a in axes if abs(a @ along[0]) < 0.5][:2]
+        Q = P[idx]
+        u, v = Q @ a1, Q @ a2
+        rms_plane = float(np.sqrt(np.mean(prim_dist(p, Q) ** 2)))
+        # the neighbouring frame faces (top, back wall) also hold some of these points
+        d0 = np.full(len(Q), np.inf)
+        for q in prims:
+            if q["type"] == "plane" and q.get("snapped") and any(abs(q["n"] @ a) > 0.999 for a in (a1, a2)):
+                d0 = np.minimum(d0, np.abs(prim_dist(q, Q)))
+        best = None
+        for t1 in np.percentile(u, np.linspace(2, 98, 33)):
+            for t2 in np.percentile(v, np.linspace(2, 98, 33)):
+                d1, d2 = np.abs(u - t1), np.abs(v - t2)
+                r = np.minimum(np.minimum(d1, d2), d0)
+                rms = float(np.sqrt(np.mean(r ** 2)))
+                if best is None or rms < best[0]:
+                    best = (rms, t1, t2)
+        rms, t1, t2 = best
+        d1, d2 = np.abs(u - t1), np.abs(v - t2)
+        own = np.minimum(d1, d2) <= d0  # points that need the new arms
+        on1, on2 = own & (d1 < d2), own & (d1 >= d2)
+        # a real chamfer fits its plane at the noise level; a false one leaves the step's variance
+        if not (rms_plane > 1.15 * noise_mm and rms < 0.92 * rms_plane
+                and min(on1.sum(), on2.sum()) > 0.15 * own.sum()):
+            continue
+        # refine: reassign to the nearer arm (or neighbour face) and re-estimate, a few times; the
+        # grid optimum is biased by the ambiguous points in the inner corner
+        for _ in range(8):
+            t1, t2 = float(np.median(u[on1])), float(np.median(v[on2]))
+            d1, d2 = np.abs(u - t1), np.abs(v - t2)
+            own = np.minimum(d1, d2) <= d0
+            on1, on2 = own & (d1 < d2), own & (d1 >= d2)
+            if min(on1.sum(), on2.sum()) < 10:
+                break
+        if min(on1.sum(), on2.sum()) < 10:
+            continue
+        new = []
+        for a, t, m in ((a1, t1, on1), (a2, t2, on2)):
+            q = {"type": "plane", "n": a.copy(), "d": -t, "snapped": True}
+            signed_cos(q, P[idx[m]], N[idx[m]])
+            q.update(rms=float(np.sqrt(np.mean(prim_dist(q, P[idx[m]]) ** 2))), n_pts=int(m.sum()))
+            new.append((q, m))
+        out[k] = new[0][0]
+        labels[idx[~own]] = -1  # the rest is handed to the neighbours by the later steps
+        labels[idx[on2]] = len(out)
+        out.append(new[1][0])
+        n_split += 1
+    if n_split:
+        log(f"  CAD: {n_split} schuin vlak(ken) vervangen door een kleine trede")
+    return out, labels
+
+
+def harmonize_normals(prims, labels, P, N, noise_mm):
+    """Visibility orientation fails where few cameras see a point (the deep part of a hole: its own
+    rim hides it); one flipped patch then turns the occupancy test around there. Points that lie on a
+    fitted surface take that surface's orientation (decided by the majority of its points)."""
+    eps = max(2.5 * noise_mm, 0.8)
+    N = N.copy()
+    n_flip = 0
+    for k, pr in enumerate(prims):
+        if "s" not in pr:
+            continue
+        cand = np.where((labels == k) | (labels < 0))[0]
+        if len(cand) == 0:
+            continue
+        cand = cand[np.abs(prim_dist(pr, P[cand])) < eps]
+        if len(cand) == 0:
+            continue
+        pn = prim_normals(pr, P[cand])
+        c = np.sum(pn * N[cand], axis=1)
+        flip = cand[c < -np.cos(np.radians(30))]
+        N[flip] *= -1
+        n_flip += len(flip)
+    return N, n_flip
+
+
+def detail_primitives(prims, labels, P, N, noise_mm, min_pts, max_new=12, seed=0):
+    """Small features (a counterbore 8 mm wide and 5 mm deep, a short boss) are lost by the main
+    segmentation: their PCA normals are blended with the neighbouring faces, so the normal-guided
+    RANSAC never collects enough agreeing points. Here the unexplained clusters are fitted with
+    models whose orientation comes from the part's frame (planes square to a frame axis, cylinders
+    along one): only positions are fitted, normals only need to agree loosely (45 deg)."""
+    rng = np.random.default_rng(seed)
+    eps = max(2.0 * noise_mm, 0.8)
+    link = 3.0 * max(noise_mm, 0.5) + 1.5
+    axes = []
+    for p in prims:
+        a = p["n"] if p["type"] == "plane" and p.get("snapped") else (p["a"] if p["type"] == "cylinder" else None)
+        if a is not None and not any(abs(a @ b) > 0.999 for b in axes):
+            axes.append(_unit(a))
+    if not axes:
+        return prims, labels
+    cos45 = np.cos(np.radians(45))
+    labels = labels.copy()
+    out = []
+    free = np.where(labels < 0)[0]
+    if len(free) < min_pts:
+        return prims, labels
+    pairs = cKDTree(P[free]).query_pairs(link, output_type="ndarray")
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+    _, comp = connected_components(coo_matrix((np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])),
+                                              shape=(len(free), len(free))), directed=False)
+    cnt = np.bincount(comp)
+    for cl in np.argsort(-cnt):
+        if cnt[cl] < min_pts or len(out) >= max_new:
+            break
+        idx = free[comp == cl]
+        for _ in range(4):  # a few surfaces per cluster (counterbore: wall + floor)
+            if len(idx) < min_pts:
+                break
+            Q, NQ = P[idx], N[idx]
+            best = None
+            for a in axes:
+                t = Q @ a
+                along = np.abs(NQ @ a) > cos45
+                for t0 in rng.choice(t[along], min(40, int(along.sum())), replace=False) if along.any() else []:
+                    ok = along & (np.abs(t - t0) < eps)
+                    if best is None or ok.sum() > best[0]:
+                        t1 = float(np.median(t[ok]))
+                        best = (int(ok.sum()), {"type": "plane", "n": a.copy(), "d": -t1})
+                u, v = _perp_basis(a)
+                X = np.c_[Q @ u, Q @ v]
+                across = np.abs(NQ @ a) < np.sin(np.radians(45))
+                if across.sum() < 3:
+                    continue
+                ia = np.where(across)[0]
+                for _ in range(60):
+                    i, j, k = rng.choice(ia, 3, replace=False)
+                    A_ = np.c_[2 * (X[[j, k]] - X[i])]
+                    if abs(np.linalg.det(A_)) < 1e-6:
+                        continue
+                    b_ = np.sum(X[[j, k]] ** 2, 1) - np.sum(X[i] ** 2)
+                    c = np.linalg.solve(A_, b_)
+                    r = float(np.linalg.norm(X[i] - c))
+                    if not (1.5 < r < 100.0):
+                        continue
+                    rad = X - c
+                    rn = np.linalg.norm(rad, axis=1)
+                    ok = across & (np.abs(rn - r) < eps)
+                    if best is not None and ok.sum() <= best[0]:
+                        continue
+                    nr = (NQ[ok] @ u) * rad[ok, 0] / np.maximum(rn[ok], 1e-9) + (NQ[ok] @ v) * rad[ok, 1] / np.maximum(rn[ok], 1e-9)
+                    ok[np.where(ok)[0][np.abs(nr) < cos45]] = False
+                    if ok.sum() >= 3 and (best is None or ok.sum() > best[0]):
+                        ang = np.arctan2(rad[ok, 1], rad[ok, 0])
+                        span = _angular_span(ang)
+                        if span < np.radians(120):  # a hole or boss; <= 90 deg is an edge strip / fillet
+                            continue
+                        # evenly covered arc, not two opposite walls of a pocket
+                        a_s = np.mod(ang - ang.min(), 2 * np.pi)
+                        hist, _ = np.histogram(a_s, bins=8, range=(0, max(span, 1e-6)))
+                        if (hist > 0.25 * ok.sum() / 8).mean() < 0.75:
+                            continue
+                        def res(x, Xo=X[ok]):
+                            return np.linalg.norm(Xo - x[:2], axis=1) - x[2]
+                        sol = least_squares(res, np.r_[c, r], loss="soft_l1", f_scale=0.5 * eps)
+                        cx, cy, rr = sol.x
+                        p0 = cx * u + cy * v + a * float(np.median(Q[ok] @ a))
+                        best = (int(ok.sum()), {"type": "cylinder", "a": a.copy(), "p": p0, "r": float(abs(rr))})
+            if best is None or best[0] < min_pts:
+                break
+            pr = best[1]
+            if any(_same_surface(pr, q, eps) for q in prims + out):
+                # already a fitted surface (e.g. the deep, badly oriented part of a hole): not a new
+                # one; harmonize_normals gives these points the surface's orientation
+                idx = np.setdiff1d(idx, idx[np.abs(prim_dist(pr, Q)) < eps])
+                continue
+            d = np.abs(prim_dist(pr, Q))
+            cs = signed_cos(pr, Q, NQ)
+            sel = (d < eps) & (cs > cos45)
+            sel_idx = _largest_component(P, idx[sel], link)
+            if len(sel_idx) < min_pts:
+                break
+            if pr["type"] == "cylinder":
+                # a square pocket's four walls also pass for a ring: of the points in a wide band
+                # around the radius, a real cylinder holds nearly all within the inlier band
+                hq = (Q - pr["p"]) @ pr["a"]
+                hs = (P[sel_idx] - pr["p"]) @ pr["a"]
+                band = (np.abs(d) < 3 * eps) & (hq >= hs.min()) & (hq <= hs.max())
+                if (np.abs(d[band]) < eps).mean() < 0.8:
+                    idx = np.setdiff1d(idx, sel_idx)
+                    continue
+            # an edge strip (points of two faces near their sharp edge) fits a small cylinder too,
+            # a false fillet: the points must not be explained already by the existing surfaces
+            Qs, Ns_ = P[sel_idx], N[sel_idx]
+            expl = np.zeros(len(sel_idx), bool)
+            for q in prims:
+                near = np.abs(prim_dist(q, Qs)) < eps
+                if near.any():
+                    cq = np.sum(prim_normals(q, Qs[near]) * Ns_[near], axis=1)
+                    cq = cq if "s" in q else np.abs(cq)
+                    expl[np.where(near)[0][cq > cos45]] = True
+            if expl.mean() > 0.5:
+                idx = np.setdiff1d(idx, sel_idx)
+                continue
+            rms = float(np.sqrt(np.mean(prim_dist(pr, P[sel_idx]) ** 2)))
+            if rms > 1.5 * max(noise_mm, 0.2):
+                break
+            signed_cos(pr, P[sel_idx], N[sel_idx])
+            pr.update(rms=rms, n_pts=int(len(sel_idx)), snapped=True, detail=True)
+            labels[sel_idx] = len(prims) + len(out)
+            out.append(pr)
+            idx = np.setdiff1d(idx, sel_idx)
+    if out:
+        log(f"  CAD: {len(out)} klein(e) detail(s) gevonden "
+            f"({sum(p['type'] == 'cylinder' for p in out)} cilinder)")
+    return prims + out, labels
 
 
 def boundary_hypotheses(prims, labels, P, N, noise_mm, max_new=40):
@@ -1768,9 +2399,6 @@ def thickness_hypotheses(prims, labels, P, max_t=6.0, max_new=12, floor_z=None):
                  "rms": 0.0, "n_pts": 0}
             if floor_z is not None and abs(n[2]) > 0.99 and abs(-q["d"] * q["n"][2] - floor_z) < 1.5:
                 continue  # the floor itself closes it
-            # check: plane moved by t against its outward normal
-            x = -p["d"] * p["n"]
-            assert abs((x - t * n) @ q["n"] + q["d"]) < 1e-6
             out.append(q)
             if len(out) >= max_new:
                 return out
@@ -1830,7 +2458,8 @@ def _approx_area(P, voxel):
 
 
 def clean_solid(shape):
-    """Keep the largest solid, fix it and merge coplanar faces."""
+    """Merge coplanar faces, keep the largest solid without internal cavities, fix it, and return it
+    as a bare TopoDS_Solid (not wrapped in a compound)."""
     from OCP.TopExp import TopExp_Explorer
     from OCP.TopAbs import TopAbs_SOLID
     from OCP.TopoDS import TopoDS
@@ -1838,20 +2467,31 @@ def clean_solid(shape):
     from OCP.BRepGProp import BRepGProp
     from OCP.ShapeFix import ShapeFix_Shape
     from OCP.ShapeUpgrade import ShapeUpgrade_UnifySameDomain
-    best, bv = None, -1.0
-    ex = TopExp_Explorer(shape, TopAbs_SOLID)
-    while ex.More():
-        so = TopoDS.Solid(ex.Current())
-        ex.Next()
-        g = GProp_GProps()
-        BRepGProp.VolumeProperties_s(so, g)
-        if abs(g.Mass()) > bv:
-            best, bv = so, abs(g.Mass())
+    from OCP.BRepClass3d import BRepClass3d
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeSolid
+
+    def largest(sh):
+        best, bv = None, -1.0
+        ex = TopExp_Explorer(sh, TopAbs_SOLID)
+        while ex.More():
+            so = TopoDS.Solid(ex.Current())
+            ex.Next()
+            g = GProp_GProps()
+            BRepGProp.VolumeProperties_s(so, g)
+            if abs(g.Mass()) > bv:
+                best, bv = so, abs(g.Mass())
+        return best
+
+    try:
+        u = ShapeUpgrade_UnifySameDomain(shape, True, True, False)
+        u.Build()
+        shape = u.Shape()
+    except Exception:
+        pass
+    best = largest(shape)
     if best is None:
         return shape
     # closed internal cavities can never be seen by a camera: they are noise -> keep the outer shell
-    from OCP.BRepClass3d import BRepClass3d
-    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeSolid
     outer = BRepClass3d.OuterShell_s(best)
     if not outer.IsNull():
         ms = BRepBuilderAPI_MakeSolid(outer)
@@ -1859,26 +2499,24 @@ def clean_solid(shape):
             best = ms.Solid()
     fx = ShapeFix_Shape(best)
     fx.Perform()
-    s = fx.Shape()
-    u = ShapeUpgrade_UnifySameDomain(s, True, True, False)
-    u.Build()
-    return u.Shape()
+    return largest(fx.Shape()) or fx.Shape()
 
-
-# ----------------------------------------------------------------------------------------------
-# 6. pipeline helpers: quality gate, named single-part STEP, assembly of OCC shapes
-# ----------------------------------------------------------------------------------------------
 
 def quality(shape, P, noise_mm, floor_z=None):
     """Deviation of the scan points from the CAD solid, and the acceptance decision."""
     rep = shape_report(shape, P, step=0.5)
+    S = np.vstack([_sample_face(f, 0.5)[0] for f in _faces_of(shape)])
+    d, _ = cKDTree(S).query(P)
+    rep["frac_far"] = float(np.mean(d > 3.0 * noise_mm))
+    rep["dev_p98"] = float(np.percentile(d, 98))
     ok = bool(rep["valid"] and rep["solid"] and rep["faces"] >= 4
-              and rep["dev_median"] <= max(1.0, 2.0 * noise_mm))
+              and rep["dev_median"] <= max(1.0, 2.0 * noise_mm)
+              and rep["frac_far"] <= 0.05)
     rep["accepted"] = ok
     return rep
 
 
-def roundtrip_ok(path, shape, vol_tol=0.005):
+def roundtrip_ok(path, shape, vol_tol=0.005, ref_volume=None):
     """Read a written STEP back and compare: must be a valid solid with the same volume and no face
     larger than the part (a face whose boundary got lost on export becomes a huge sheet)."""
     from OCP.STEPControl import STEPControl_Reader
@@ -1894,11 +2532,32 @@ def roundtrip_ok(path, shape, vol_tol=0.005):
     rs = r.OneShape()
     if not BRepCheck_Analyzer(rs).IsValid():
         return False, "teruggelezen STEP ongeldig"
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_SOLID, TopAbs_SHELL, TopAbs_WIRE
+    from OCP.ShapeAnalysis import ShapeAnalysis_FreeBounds
+    def count(sh, t):
+        ex, n = TopExp_Explorer(sh, t), 0
+        while ex.More():
+            n += 1
+            ex.Next()
+        return n
+    if count(rs, TopAbs_SOLID) != 1 or count(rs, TopAbs_SHELL) != 1:
+        return False, f"{count(rs, TopAbs_SOLID)} solids / {count(rs, TopAbs_SHELL)} schillen i.p.v. 1"
+    fb = ShapeAnalysis_FreeBounds(rs, 1e-4)
+    if count(fb.GetClosedWires(), TopAbs_WIRE) + count(fb.GetOpenWires(), TopAbs_WIRE) > 0:
+        return False, "open randen"
+    if len(_faces_of(rs)) != len(_faces_of(shape)):
+        return False, f"{len(_faces_of(rs))} vlakken i.p.v. {len(_faces_of(shape))}"
     def vol(x):
         g = GProp_GProps()
         BRepGProp.VolumeProperties_s(x, g)
         return g.Mass()
     v0, v1 = vol(shape), vol(rs)
+    if v1 <= 0:
+        return False, "negatief volume (omgekeerde oriëntatie)"
+    if ref_volume:  # independent reference: the summed volume of the chosen cells
+        v0 = ref_volume
+        vol_tol = max(vol_tol, 0.02)  # removed internal cavities may add a little
     if abs(v1 - v0) > vol_tol * abs(v0):
         return False, f"volume na teruglezen {v1:.0f} i.p.v. {v0:.0f} mm3"
     b0 = Bnd_Box()
@@ -1910,6 +2569,34 @@ def roundtrip_ok(path, shape, vol_tol=0.005):
         if b.CornerMax().Distance(b.CornerMin()) > 1.5 * ext0:
             return False, "vlak verloor zijn begrenzing bij export"
     return True, "ok"
+
+
+def export_solid(path, name, shape, rgb, ref_volume=None):
+    """Write one part and make sure it reads back correctly. Repair cascade when it does not:
+    1. small-edge / wire fixes, 2. the whole solid as B-spline (NURBS) geometry: same shape,
+    universally readable. Returns (ok, method, shape_written)."""
+    from OCP.ShapeFix import ShapeFix_Shape, ShapeFix_Wireframe
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_NurbsConvert
+    write_named_step(path, [(name, shape, rgb)])
+    ok, why = roundtrip_ok(path, shape, ref_volume=ref_volume)
+    if ok:
+        return True, "analytisch", shape
+    sf = ShapeFix_Shape(shape)
+    sf.Perform()
+    wf = ShapeFix_Wireframe(sf.Shape())
+    wf.SetPrecision(0.01)
+    wf.FixSmallEdges()
+    wf.FixWireGaps()
+    s1 = wf.Shape()
+    write_named_step(path, [(name, s1, rgb)])
+    if roundtrip_ok(path, s1, ref_volume=ref_volume)[0]:
+        return True, "analytisch (gerepareerd)", s1
+    s2 = BRepBuilderAPI_NurbsConvert(shape, True).Shape()
+    write_named_step(path, [(name, s2, rgb)])
+    ok, why2 = roundtrip_ok(path, s2, ref_volume=ref_volume)
+    if ok:
+        return True, "NURBS", s2
+    return False, f"{why}; NURBS: {why2}", shape
 
 
 def write_named_step(path, parts, assembly_name=None):

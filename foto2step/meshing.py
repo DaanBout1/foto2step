@@ -145,7 +145,7 @@ def orient_by_visibility(pts, nrm, cam_centers, splat_mm=None, max_cams=400, chu
     F = np.c_[np.arange(n), np.arange(n) + n, np.arange(n) + 2 * n]
     scene = o3d.t.geometry.RaycastingScene()
     scene.add_triangles(o3d.core.Tensor(V.astype(np.float32)), o3d.core.Tensor(F.astype(np.uint32)))
-    off = max(1.7 * splat_mm, 1.0)
+    off = float(np.clip(1.2 * splat_mm, 0.6, 1.5))  # must stay inside thin walls (2 mm sheet)
     votes = np.zeros(n)
     per = max(1, chunk // max(1, len(C)))
     for i0 in range(0, n, per):
@@ -160,8 +160,11 @@ def orient_by_visibility(pts, nrm, cam_centers, splat_mm=None, max_cams=400, chu
             free = (hit >= L - off) & front
             votes[sl] += sgn * free.sum(1)
     if auto and _factor > 1.0 and np.mean(votes != 0) < 0.9:
-        # real scans have floaters: closed splat sheets then block too many rays -> smaller splats
-        return orient_by_visibility(pts, nrm, cam_centers, None, max_cams, chunk, _factor=1.0)
+        # real scans have floaters: closed splat sheets then block too many rays -> smaller splats;
+        # keep whichever pass decided more points
+        alt, dec_alt = orient_by_visibility(pts, nrm, cam_centers, None, max_cams, chunk, _factor=1.0)
+        if dec_alt > np.mean(votes != 0):
+            return alt, dec_alt
     out = nrm.copy()
     out[votes < 0] *= -1
     # consistency: neighbours on the same smooth surface (normals nearly parallel) must agree in sign;

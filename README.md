@@ -191,10 +191,16 @@ Delen handmatig afbakenen (ook met maar 1 stand): `motion: manual_bodies: [{name
    * normalen gericht met een zichtbaarheidstest (stralen naar de camera's), ruis gemeten uit de scan zelf;
    * vlakken en cilinders gezocht (RANSAC), samengevoegd, recht gezet op het assenstelsel van het onderdeel
      (evenwijdig/haaks), opnieuw gefit op duizenden punten: de ruis middelt weg;
+   * kleine details (verzinkboring, korte naaf) apart gezocht met vlakken/cilinders op het assenstelsel van het deel;
+     een schuin vlak over een kleine trede (valse afschuining) wordt vervangen door de trede als die duidelijk beter past;
+   * spiegelingen/dubbellagen (glanzend metaal: een tweede laag een paar mm boven het echte vlak) worden herkend en
+     verwijderd; een deel dat iets scheef op de vloer staat krijgt een onderkant haaks op het deel (geen wig);
    * voorstellen voor wat niet te zien was: lage wandjes bij kleine treden, achterkant van plaatwerk uit de
-     gemeten plaatdikte;
+     gemeten plaatdikte; dunne plaatranden worden op de gemeten rand gezet (niet op de ruisuitschieters);
    * alle oppervlakken verdelen de ruimte in cellen; per cel binnen/buiten via de scan en de georiënteerde vlakken,
-     opgelost met een minimale snede (grensvlakken zonder meetpunten zijn duur) → altijd een gesloten solid.
+     opgelost met een minimale snede (grensvlakken zonder meetpunten zijn duur, maar alleen als een camera ze had
+     kunnen zien: de diepte van een gat is geen bewijs dat het dicht is) → altijd een gesloten solid;
+   * oppervlakken die uiteindelijk (bijna) niets begrenzen worden weggelaten en de solid wordt opnieuw opgelost.
    * Kwaliteitspoort: alleen gebruikt als hij geldig is én goed op de scan past, anders de mesh-STEP.
      De mesh-versie staat altijd ook in `onderdelen/<naam>_mesh.step`. Het rapport toont welke gebruikt is.
 
@@ -206,13 +212,19 @@ geziene oppervlak (ongeziene delen apart gerapporteerd):
 | Onderdeel (0,5 mm ruis) | Resultaat | 99,9% afwijking |
 |---|---|---|
 | Blok | geslaagd, 6/6 vlakken | 0,06 mm |
-| Gereedschapsblok (3 groeven, T-profiel, kamer, gat) | geslaagd, 23/23 vlakken | 0,22 mm |
+| Gereedschapsblok (3 groeven, T-profiel, kamer, gat) | geslaagd, 23/23 vlakken | 0,23 mm |
 | Beugel met naaf en gat | geslaagd | 0,11 mm |
-| Ondiepe details (2 mm kussen, 3 mm kamer, 3×3 sponning) | nog niet: vlakken goed, sponning wordt soms afschuining | 1,2–3 mm |
-| Plaatwerk Z-profiel 2 mm | nog niet: dunne randen ±1,5 mm | 1,5 mm |
-| Schuin vlak, schuin gat, verzinkboring | nog niet | 4–9 mm |
+| Ondiepe details (2 mm kussen, 3 mm kamer, 3×3 sponning) | geslaagd, 18/18 vlakken | 0,60 mm |
+| Plaatwerk Z-profiel 2 mm | geslaagd | 0,13 mm |
+| Schuin vlak 30°, schuin gat, verzinkboring | geslaagd, 11/12 vlakken | 0,29 mm |
+| Gereedschapsblok 2° scheef op de vloer | geslaagd, 23/23 vlakken | 0,59 mm |
+| Blok met spiegel-dubbellaag (2,5 mm) | geslaagd, 6/6 vlakken | 0,06 mm |
+| Gereedschapsblok met spiegel-dubbellaag | geslaagd, 23/23 vlakken | 0,19 mm |
 
-Een diep gat dat geen camera kan inkijken wordt dichtgemaakt (niet te meten) en apart gemeld.
+Bij 1 mm ruis (twee keer de ruis van de echte scan) halen de eenvoudige delen het nog, de delen met groeven
+niet: de groeven worden dan niet meer als cilinder herkend. Beter fotograferen (mat spuiten) helpt hier het meest.
+
+Een gat waarvan de diepte niet te zien is blijft open waar de wanden gezien zijn; ongeziene delen worden apart gemeld.
 
 ## Gauntlet (zelftest)
 

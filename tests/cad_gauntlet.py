@@ -105,13 +105,31 @@ def case_offframe():
     return s
 
 
+def _tilted(shape, deg=2.0):
+    """Part standing tilted on the floor (e.g. on a bent marker sheet): rotate about x, lift to z>=0."""
+    from OCP.gp import gp_Trsf, gp_Ax1, gp_Pnt, gp_Dir, gp_Vec
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
+    t = gp_Trsf()
+    t.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(1, 0, 0)), np.radians(deg))
+    s = BRepBuilderAPI_Transform(shape, t, True).Shape()
+    V, _ = cadfit._mesh_of_shape(s, 0.05)
+    t2 = gp_Trsf()
+    t2.SetTranslation(gp_Vec(0, 0, -float(V[:, 2].min())))
+    return BRepBuilderAPI_Transform(s, t2, True).Shape()
+
+
+def case_tilted_tool_block():
+    return _tilted(case_tool_block(), 2.0)
+
+
 CASES = {"box": case_box, "tool_block": case_tool_block, "bracket": case_bracket,
-         "shallow": case_shallow, "zprofile": case_zprofile, "offframe": case_offframe}
+         "shallow": case_shallow, "zprofile": case_zprofile, "offframe": case_offframe,
+         "tilted_tool_block": case_tilted_tool_block, "ghost_box": case_box, "ghost_tool_block": case_tool_block}
 
 
 # ---------------------------------------------------------------- scan simulation
 
-def simulate_scan(shape, noise, density=1.6, seed=0):
+def simulate_scan(shape, noise, density=1.6, seed=0, ghost=False):
     """Area-uniform samples on all faces except the underside (z = 0), Gaussian noise along the
     surface normal plus a little tangential jitter; also returns camera centres on two rings."""
     rng = np.random.default_rng(seed)
@@ -155,6 +173,10 @@ def simulate_scan(shape, noise, density=1.6, seed=0):
         seen += front & (hit >= L - 1e-3)
     keep = seen >= 2
     P, N = P[keep], N[keep]
+    if ghost:  # reflections on shiny tops: a second layer 2.5 mm off with 40% of the density
+        top = np.where((N[:, 2] > 0.9) & (rng.random(len(P)) < 0.4))[0]
+        P = np.vstack([P, P[top] + 2.5 * N[top]])
+        N = np.vstack([N, N[top]])
     n_out = int(0.01 * len(P))
     out_i = rng.choice(len(P), n_out, replace=False)
     P[out_i] += rng.normal(0, 5 * noise, (n_out, 3))
@@ -244,14 +266,14 @@ def run(noise=0.5, names=None, out_dir=Path("cad_gauntlet_out"), seeds=(0,)):
         t0 = time.time()
         try:
             truth = CASES[name]()
-            P, N, cams = simulate_scan(truth, noise, seed=seed)
+            P, N, cams = simulate_scan(truth, noise, seed=seed, ghost=name.startswith("ghost"))
             # the pipeline's noise estimate is low; give 60% of the truth like it would
             shape, info = cadfit.reconstruct(P, cams, noise_mm=0.6 * noise, floor_z=0.0, normals=None)
             g = grade(shape, truth, P, cams)
             g.update({k: v for k, v in info.items() if isinstance(v, (int, float, str, bool))})
-            cadfit.write_step(shape, out_dir / f"{name}_s{seed}.step")
-            ok, why = cadfit.roundtrip_ok(out_dir / f"{name}_s{seed}.step", shape)
-            g["roundtrip"] = why
+            ok, how, _ = cadfit.export_solid(out_dir / f"{name}_s{seed}.step", name, shape, (0.6, 0.6, 0.7),
+                                             ref_volume=info.get("cells_volume"))
+            g["export"] = how
             g["pass"] = bool(g["pass"] and ok)
         except Exception as e:  # a crash is a failed case, not a crashed gauntlet
             g = {"pass": False, "error": repr(e)}

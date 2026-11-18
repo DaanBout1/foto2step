@@ -378,22 +378,33 @@ class Pipeline:
             floor_z = 0.0 if (b.get("static") and self.cfg["mesh"].get("remove_floor", True)) else None
             log(f"  CAD-reconstructie (vlakken + cilinders -> solid)")
             shape, info = cadfit.reconstruct(pts, C, noise_mm=max(noise, 0.2), floor_z=floor_z)
-            q = cadfit.quality(shape, pts, noise, floor_z)
+            q = cadfit.quality(shape, pts, max(noise, info.get("noise_mm", 0.0)), floor_z)
             rep = {**info, **{k: v for k, v in q.items()}}
-            if mode is True or mode in ("true", "ja"):
-                rep["accepted"] = bool(q["valid"])
+            forced = mode is True or mode in ("true", "ja")
+            if not (q["valid"] and q["solid"]):
+                rep["accepted"] = False
+                rep["reason"] = "geen geldige solid"
+                return rep
+            # a valid CAD solid is always delivered as <name>_cad.step (checked by reading it back)
+            path_cad = path.with_name(f"{name}_cad.step")
+            ok, how, shape = cadfit.export_solid(path_cad, name, shape, rgb, ref_volume=info.get("cells_volume"))
+            rep["geometry"] = how
+            rep["cad_file"] = path_cad.name if ok else None
+            if not ok:  # never hand out a STEP that does not read back correctly
+                rep["accepted"] = False
+                rep["reason"] = f"STEP-controle: {how}"
+                return rep
+            log(f"  {path_cad.name}: CAD-solid ({how}), {q['faces']} vlakken ({info['surfaces']} gefitte oppervlakken), "
+                f"afwijking punten->STEP mediaan {q['dev_median']:.2f} / 98% {q['dev_p98']:.2f} mm, "
+                f"{q['frac_far'] * 100:.1f}% punten verder dan 3x ruis")
+            rep["accepted"] = bool(q["accepted"] or forced)
             if rep["accepted"]:
-                cadfit.write_named_step(path, [(name, shape, rgb)])
-                ok, why = cadfit.roundtrip_ok(path, shape)
-                if not ok:  # never hand out a STEP that does not read back correctly
-                    rep["accepted"] = False
-                    rep["reason"] = f"STEP-controle: {why}"
-                    return rep
-                log(f"  {path.name}: CAD-solid, {q['faces']} vlakken ({info['surfaces']} gefitte oppervlakken), "
-                    f"afwijking punten->STEP mediaan {q['dev_median']:.2f} / 95% {q['dev_p95']:.2f} mm")
+                import shutil
+                shutil.copyfile(path_cad, path)
+                log(f"  {path.name}: CAD-solid gebruikt")
             else:
-                rep["reason"] = ("geen geldige solid" if not (q["valid"] and q["solid"]) else
-                                 f"past slecht op de scan (mediaan {q['dev_median']:.2f} mm)")
+                rep["reason"] = (f"plaatselijk te grote afwijking ({q['frac_far'] * 100:.0f}% van de punten verder dan "
+                                 f"3x ruis); CAD-solid staat in {path_cad.name}")
             return rep
         except Exception as e:  # never lose the part because the CAD path failed
             log(f"  CAD-reconstructie mislukt: {e!r}")
