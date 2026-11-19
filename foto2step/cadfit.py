@@ -17,6 +17,7 @@ All lengths in mm. Freeform regions (NURBS) plug into the same arrangement/selec
 """
 from __future__ import annotations
 
+import os
 import numpy as np
 import time
 
@@ -108,7 +109,32 @@ def fit_cylinder(P, a0, p0, r0):
     return {"type": "cylinder", "a": a, "p": p, "r": float(abs(r))}
 
 
+def _extr_nearest(prim, P):
+    """Extrusion of a 2D polyline: (2D coords of P, index of the nearest polyline sample)."""
+    from scipy.spatial import cKDTree
+    t = prim.get("_tree")
+    if t is None:
+        t = cKDTree(prim["poly"])
+        prim["_tree"] = t
+    X = np.c_[np.asarray(P) @ prim["u"], np.asarray(P) @ prim["v"]]
+    _, j = t.query(X)
+    return X, j
+
+
+def extr_dist(prim, P):
+    X, j = _extr_nearest(prim, P)
+    return np.sum((X - prim["poly"][j]) * prim["pnrm"][j], axis=1)
+
+
+def extr_normals(prim, P):
+    _, j = _extr_nearest(prim, P)
+    n2 = prim["pnrm"][j]
+    return n2[:, :1] * prim["u"][None] + n2[:, 1:2] * prim["v"][None]
+
+
 def prim_dist(prim, P):
+    if prim["type"] == "extrusion":
+        return extr_dist(prim, P)
     return plane_dist(prim, P) if prim["type"] == "plane" else cyl_dist(prim, P)
 
 
@@ -118,6 +144,8 @@ def prim_normals(prim, P):
     sg = prim.get("s", 1.0)
     if prim["type"] == "plane":
         return np.broadcast_to(sg * prim["n"], P.shape)
+    if prim["type"] == "extrusion":
+        return sg * extr_normals(prim, P)
     return sg * cyl_normals(prim, P)
 
 
@@ -323,7 +351,7 @@ def merge_similar(prims, labels, P, noise_mm):
         for i in range(len(prims)):
             for j in range(i + 1, len(prims)):
                 a, b = prims[i], prims[j]
-                if a is None or b is None or a["type"] != b["type"]:
+                if a is None or b is None or a["type"] != b["type"] or a["type"] == "extrusion":
                     continue
                 Pi, Pj = P[labels == i], P[labels == j]
                 if len(Pi) == 0 or len(Pj) == 0:
@@ -435,11 +463,13 @@ def _sample_face(face, step):
     BRepMesh_IncrementalMesh(face, step * 0.5, False, 0.3, True)
     loc = TopLoc_Location()
     tri = BRep_Tool.Triangulation_s(face, loc)
+    _sample_face.node = None
     if tri is None:
         return np.zeros((0, 3)), 0.0
     tr = loc.Transformation()
     V = np.array([[tri.Node(i).Transformed(tr).X(), tri.Node(i).Transformed(tr).Y(), tri.Node(i).Transformed(tr).Z()]
                   for i in range(1, tri.NbNodes() + 1)])
+
     T = np.array([[tri.Triangle(i).Value(j) - 1 for j in (1, 2, 3)] for i in range(1, tri.NbTriangles() + 1)])
     if len(T) == 0:
         return np.zeros((0, 3)), 0.0
@@ -451,6 +481,18 @@ def _sample_face(face, step):
     r1, r2 = rng.random(len(idx)), rng.random(len(idx))
     s1 = np.sqrt(r1)
     pts = (1 - s1)[:, None] * A[idx] + (s1 * (1 - r2))[:, None] * B[idx] + (s1 * r2)[:, None] * C[idx]
+    # random samples on a curved face lie on the chords of its mesh (up to the deflection away):
+    # one sample projected onto the surface itself tells which primitive the face belongs to
+    _sample_face.node = pts[len(pts) // 2][None]
+    try:
+        from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
+        from OCP.gp import gp_Pnt
+        pr = GeomAPI_ProjectPointOnSurf(gp_Pnt(*map(float, pts[len(pts) // 2])), BRep_Tool.Surface_s(face))
+        if pr.NbPoints():
+            q = pr.NearestPoint()
+            _sample_face.node = np.array([[q.X(), q.Y(), q.Z()]])
+    except Exception:
+        pass
     return pts, float(area.sum())
 
 
@@ -1183,11 +1225,63 @@ def _surface_face(prim, lo, hi):
         u, _ = _perp_basis(n)
         ax = gp_Ax3(gp_Pnt(*c), gp_Dir(*n), gp_Dir(*u))
         return BRepBuilderAPI_MakeFace(gp_Pln(ax), -diag, diag, -diag, diag).Face()
+    if prim["type"] == "extrusion":
+        # the profile curve (B-spline through the fitted polyline, ends extended along their
+        # tangents) swept along the extrusion direction over the whole box
+        from OCP.Geom import Geom_SurfaceOfLinearExtrusion
+        a = prim["a"]
+        crv = extr_bspline(prim, float(ctr @ a) - diag)
+        surf = Geom_SurfaceOfLinearExtrusion(crv, gp_Dir(*map(float, a)))
+        return BRepBuilderAPI_MakeFace(surf, crv.FirstParameter(), crv.LastParameter(), 0.0, 2 * diag, 1e-6).Face()
     a, p0, r = prim["a"], prim["p"], prim["r"]
     t0 = (ctr - p0) @ a
     u, _ = _perp_basis(a)
     ax = gp_Ax3(gp_Pnt(*(p0 + t0 * a)), gp_Dir(*a), gp_Dir(*u))
     return BRepBuilderAPI_MakeFace(gp_Cylinder(ax, r), 0.0, 2 * np.pi, -diag, diag).Face()
+
+
+def extr_bspline(prim, t0=0.0):
+    """The B-spline profile curve of an extrusion primitive (3D, in the plane at height t0 along a)."""
+    from OCP.GeomAPI import GeomAPI_PointsToBSpline
+    from OCP.OCP.collections import Array1_gp_Pnt
+    from OCP.GeomAbs import GeomAbs_C2
+    from OCP.gp import gp_Pnt
+    a, u, v = prim["a"], prim["u"], prim["v"]
+    pts = prim["poly_ext"]
+    arr = Array1_gp_Pnt(1, len(pts))
+    for i, (x, y) in enumerate(pts):
+        arr.SetValue(i + 1, gp_Pnt(*map(float, x * u + y * v + t0 * a)))
+    return GeomAPI_PointsToBSpline(arr, 3, 3, GeomAbs_C2, 0.01).Curve()
+
+
+def extr_resample(prim, step=0.2):
+    """Make the distance model of an extrusion the B-spline itself: dense samples of the curve the
+    face is built from, normals turned to the side of the given ones (prim['pnrm'])."""
+    from OCP.GeomAdaptor import GeomAdaptor_Curve
+    from OCP.GCPnts import GCPnts_UniformAbscissa
+    crv = extr_bspline(prim, 0.0)
+    ad = GeomAdaptor_Curve(crv)
+    ua = GCPnts_UniformAbscissa(ad, step)
+    u, v = prim["u"], prim["v"]
+    X, T = [], []
+    from OCP.gp import gp_Pnt, gp_Vec
+    for i in range(1, ua.NbPoints() + 1):
+        p, d1 = gp_Pnt(), gp_Vec()
+        crv.D1(ua.Parameter(i), p, d1)
+        q = np.array([p.X(), p.Y(), p.Z()])
+        t = np.array([d1.X(), d1.Y(), d1.Z()])
+        X.append([q @ u, q @ v])
+        T.append([t @ u, t @ v])
+    X, T = np.array(X), np.array(T)
+    T /= np.maximum(np.linalg.norm(T, axis=1, keepdims=True), 1e-12)
+    Nn = np.c_[-T[:, 1], T[:, 0]]
+    t_old = cKDTree(prim["poly"])
+    _, j = t_old.query(X)
+    if np.sum(Nn * prim["pnrm"][j]) < 0:
+        Nn = -Nn
+    prim["poly"], prim["pnrm"] = X, Nn
+    prim.pop("_tree", None)
+    return prim
 
 
 def _mesh_of_shape(shape, defl=0.2):
@@ -1347,14 +1441,30 @@ def cell_solid(prims, P, occ, floor_z=None, margin=0.3, grid=0.6, min_frac=0.5, 
     mv.Perform()
     if mv.HasErrors():
         raise RuntimeError("cellencomplex mislukt")
+    cplx = mv.Shape()
+    if any(pr["type"] == "extrusion" for pr in prims):
+        # faces cut by a free-form curve can lack their 2D edge curves (they then cannot be meshed
+        # or classified): let the standard healing add them
+        from OCP.ShapeFix import ShapeFix_Shape
+        fx = ShapeFix_Shape(cplx)
+        fx.SetPrecision(1e-5)
+        fx.SetMaxTolerance(1e-3)
+        fx.Perform()
+        cplx = fx.Shape()
     cells = []
-    ex = TopExp_Explorer(mv.Shape(), TopAbs_SOLID)
+    ex = TopExp_Explorer(cplx, TopAbs_SOLID)
     while ex.More():
         c = TopoDS.Solid(ex.Current())
         ex.Next()
         Vc, _ = _mesh_of_shape(c, defl=0.5)
         if len(Vc) and np.all(Vc.min(0) >= lo - 0.01) and np.all(Vc.max(0) <= hi + 0.01):
             cells.append(c)
+        elif os.environ.get("FOTO2STEP_DEBUG_CELLS") and len(Vc):
+            from OCP.GProp import GProp_GProps
+            from OCP.BRepGProp import BRepGProp
+            g_ = GProp_GProps()
+            BRepGProp.VolumeProperties_s(c, g_)
+            log(f"    cel buiten doos: vol {g_.Mass():.0f} lo {np.round(Vc.min(0) - lo, 2)} hi {np.round(Vc.max(0) - hi, 2)}")
     if len(cells) > max_cells:
         raise RuntimeError(f"te veel cellen ({len(cells)})")
     # grid samples once, occupancy of the reference once
@@ -1364,6 +1474,12 @@ def cell_solid(prims, P, occ, floor_z=None, margin=0.3, grid=0.6, min_frac=0.5, 
     keep, fracs, vols = [], [], []
     for c in cells:
         V, T = _mesh_of_shape(c, defl=0.1)
+        if len(T) == 0 and os.environ.get("FOTO2STEP_DEBUG_CELLS"):
+            from OCP.GProp import GProp_GProps
+            from OCP.BRepGProp import BRepGProp
+            g_ = GProp_GProps()
+            BRepGProp.VolumeProperties_s(c, g_)
+            log(f"    cel zonder mesh: vol {g_.Mass():.0f}")
         if len(T) == 0:  # keep fracs/keep aligned with cells (review finding)
             fracs.append(0.0)
             vols.append(0.0)
@@ -1470,6 +1586,7 @@ def _graphcut_cells(cells, frac, vol, lam, P=None, eps=1.0, step=1.0, w_unsup=4.
     fsup = {}   # 1 - fraction that is unsupported although a camera could have seen it (penalty)
     fdata = {}  # fraction actually supported by points (evidence for orientation)
     face_pts = {}
+    face_node = {}
     tree = cKDTree(P) if P is not None else None
     for i, c in enumerate(cells):
         for f in _faces_of(c):
@@ -1479,6 +1596,7 @@ def _graphcut_cells(cells, frac, vol, lam, P=None, eps=1.0, step=1.0, w_unsup=4.
                 S, a = _sample_face(f, step)
                 farea[h] = a
                 face_pts[h] = S
+                face_node[h] = _sample_face.node
                 if floor_plane is not None:
                     on_floor = len(S) and np.all(np.abs(S @ floor_plane[0] - floor_plane[1]) < 0.05)
                 else:
@@ -1495,7 +1613,7 @@ def _graphcut_cells(cells, frac, vol, lam, P=None, eps=1.0, step=1.0, w_unsup=4.
                         # looking along a bore sees its wall only at a grazing angle (no points)
                         nrm_s = None
                         if prims is not None:
-                            xm = S[len(S) // 2][None]
+                            xm = face_node[h]
                             dk = [abs(prim_dist(pr, xm)[0]) for pr in prims]
                             kk = int(np.argmin(dk))
                             if dk[kk] < 0.05:
@@ -1523,7 +1641,7 @@ def _graphcut_cells(cells, frac, vol, lam, P=None, eps=1.0, step=1.0, w_unsup=4.
             S = face_pts.get(h)
             if S is None or len(S) == 0:
                 continue
-            x = S[len(S) // 2]
+            x = face_node[h][0]
             dk = [abs(prim_dist(pr, x[None])[0]) for pr in prims]
             k = int(np.argmin(dk))
             if dk[k] > 0.05 or "s" not in prims[k]:
@@ -1648,7 +1766,9 @@ def refine_primitives(prims, labels, P, N, noise_mm, iters=4, oriented=False):
             if inl.sum() < 10:
                 break
             Qi = Q[inl]
-            if p["type"] == "plane":
+            if p["type"] == "extrusion":
+                pass  # fitted on the whole profile already
+            elif p["type"] == "plane":
                 if p.get("snapped"):
                     p["d"] = -float(np.mean(Qi @ p["n"]))
                 else:
@@ -1684,7 +1804,7 @@ def dedupe_surfaces(prims, tol=None, noise_mm=0.5):
         dup = False
         for j in kept:
             q = prims[j]
-            if p["type"] != q["type"]:
+            if p["type"] != q["type"] or p["type"] == "extrusion":
                 continue
             if p["type"] == "plane":
                 c = p["n"] @ q["n"]
@@ -2069,6 +2189,7 @@ def reconstruct(P, cams, noise_mm, floor_z=0.0, normals=None, voxel=None, log_fn
             shape2 = clean_solid(shape2)
             q1 = quality(shape, Pd, noise_mm, floor_z)
             q2 = quality(shape2, Pd, noise_mm, floor_z)
+            reconstruct.simpl_q = (q1, q2, [prims[k]["type"] for k in drop], used.round(1).tolist())
             # keep the simpler model unless it fits clearly worse
             if q2["dev_p95"] <= q1["dev_p95"] + 0.25 * noise_mm and q2["frac_far"] <= q1["frac_far"] + 0.01:
                 shape, rep, prims = shape2, rep2, keep_p
@@ -2089,7 +2210,7 @@ def _surface_areas(shape, prims, tol=0.05):
         S, a = _sample_face(f, 2.0)
         if len(S) == 0:
             continue
-        x = S[len(S) // 2][None]
+        x = _sample_face.node
         d = [abs(prim_dist(p, x)[0]) for p in prims]
         k = int(np.argmin(d)) if d else -1
         if k >= 0 and d[k] < tol:
@@ -2101,6 +2222,8 @@ def _same_surface(p, q, tol):
     """Two primitives describing the same geometric surface (orientation ignored)."""
     if p["type"] != q["type"]:
         return False
+    if p["type"] == "extrusion":
+        return p is q
     if p["type"] == "plane":
         c = p["n"] @ q["n"]
         return abs(c) > 0.999 and abs(p["d"] - np.sign(c) * q["d"]) < tol
@@ -2297,7 +2420,7 @@ def split_false_chamfers(prims, labels, P, N, noise_mm):
     n_split = 0
     for k, p in enumerate(prims):
         idx = np.where(labels == k)[0]
-        if len(idx) < 60:
+        if len(idx) < 60 or p["type"] == "extrusion":
             continue
         if p["type"] == "plane":
             if p.get("snapped"):
@@ -2619,7 +2742,7 @@ def boundary_hypotheses(prims, labels, P, N, noise_mm, max_new=40):
     if len(axes) < 2:
         return []
     existing = [(p["n"], -p["d"]) for p in prims if p["type"] == "plane"]
-    cyls = [p for p in prims if p["type"] == "cylinder"]
+    cyls = [p for p in prims if p["type"] in ("cylinder", "extrusion")]
     tree = cKDTree(P)
     out = []
     for k, p in enumerate(prims):
@@ -2635,7 +2758,8 @@ def boundary_hypotheses(prims, labels, P, N, noise_mm, max_new=40):
             for pos in (np.percentile(t, 0.5), np.percentile(t, 99.5)):
                 if any(abs(n @ e) > 0.999 and abs(off * np.sign(n @ e) - pos) < 1.5 for n, off in existing):
                     continue
-                # the region may end on a known curved surface (counterbore floor -> its bore wall)
+                # the region may end on a known curved surface (counterbore floor -> its bore wall, a flat
+                # face running tangentially into a profile curve)
                 E = Q[np.abs(t - pos) < 2 * eps]
                 if len(E) and cyls and np.mean(np.min(np.stack([np.abs(prim_dist(c_, E)) for c_ in cyls], 1), 1)
                                                < 1.5 * eps) > 0.5:

@@ -28,6 +28,8 @@ from .log import log
 # gauntlet it fixed the T-slot rail but cost detail on prismatic parts (bracket, shallow steps).
 import os as _os
 AUTHORITY = _os.environ.get("FOTO2STEP_PROFILE_AUTHORITY", "0") == "1"
+# free-form profile curves (several arcs in a row) as one extruded spline surface
+SPLINES = _os.environ.get("FOTO2STEP_PROFILE_SPLINES", "1") == "1"
 
 
 def _raster(X, cell, lo, shape):
@@ -214,11 +216,26 @@ def _axis_lines(X, NX, noise_mm, min_support, bin_w=0.1):
                 for ts, os_ in zip(np.split(tq, cuts), np.split(oq, cuts)):
                     if len(ts) < 8 or ts[-1] - ts[0] < 3.0:
                         continue
-                    # a straight piece: no curvature along it (the flattest part of a bore is curved)
-                    tc = ts - ts.mean()
-                    k2 = np.linalg.lstsq(np.c_[np.ones_like(tc), tc, tc ** 2], os_, rcond=None)[0][2]
-                    if abs(2 * k2) > 0.03:
+                    # a straight piece: no curvature along it (the flattest part of a bore is curved).
+                    # Judged without its ends: where a groove starts, its first mm stays within the
+                    # band of the face and bends the ends of an otherwise straight piece
+                    trim = min(1.5, 0.2 * (ts[-1] - ts[0]))
+                    mi = (ts > ts[0] + trim) & (ts < ts[-1] - trim)
+                    if mi.sum() < 8:
                         continue
+                    tc = ts[mi] - ts[mi].mean()
+                    A = np.c_[np.ones_like(tc), tc, tc ** 2]
+                    coef, *_ = np.linalg.lstsq(A, os_[mi], rcond=None)
+                    res = os_[mi] - A @ coef
+                    s2 = float(res @ res) / max(1, len(tc) - 3)
+                    try:
+                        sd_k2 = float(np.sqrt(s2 * np.linalg.inv(A.T @ A)[2, 2]))
+                    except np.linalg.LinAlgError:
+                        continue
+                    if abs(2 * coef[2]) > 0.03 or (abs(2 * coef[2]) > 0.01 and abs(coef[2]) > 3 * sd_k2):
+                        continue  # curved (the flank of a bore) or significantly curved (a gentle cove)
+                    if abs(coef[1]) > np.tan(np.radians(8)):
+                        continue  # runs across the band at an angle: a slope, not this edge
                     spans.append((ts[0], ts[-1]))
                 if not spans:
                     continue
@@ -263,6 +280,29 @@ def _chains(Y, Nn, idx, link=0.9):
     return out
 
 
+def _smooth_polyline(Z, Nz, step=0.25, win=2.0):
+    """Ordered thin samples -> smooth, evenly resampled polyline with normals (oriented like Nz)."""
+    if len(Z) < 5:
+        return None
+    seg = np.linalg.norm(np.diff(Z, axis=0), axis=1)
+    s = np.r_[0, np.cumsum(seg)]
+    if s[-1] < 2.0:
+        return None
+    ss = np.arange(0, s[-1] + 1e-9, step)
+    P = np.c_[np.interp(ss, s, Z[:, 0]), np.interp(ss, s, Z[:, 1])]
+    k = max(1, int(round(win / step)))
+    ker = np.ones(2 * k + 1) / (2 * k + 1)
+    pad = np.r_[np.repeat(P[:1], k, 0), P, np.repeat(P[-1:], k, 0)]
+    P = np.c_[np.convolve(pad[:, 0], ker, "valid"), np.convolve(pad[:, 1], ker, "valid")]
+    T = np.gradient(P, axis=0)
+    T /= np.maximum(np.linalg.norm(T, axis=1, keepdims=True), 1e-12)
+    N = np.c_[-T[:, 1], T[:, 0]]
+    nz = np.c_[np.interp(ss, s, Nz[:, 0]), np.interp(ss, s, Nz[:, 1])]
+    if np.sum(N * nz) < 0:
+        N = -N
+    return P, N
+
+
 def _arc_spline(Y, chain, tol):
     """Cover an ordered chain of thin samples with as few arcs as possible (greedy, each arc as
     long as a circle stays within tol of its samples). Returns [(c, r, i0, i1)]."""
@@ -291,6 +331,114 @@ def _arc_spline(Y, chain, tol):
     return arcs
 
 
+def _g1_runs(Y, chains, noise_mm, min_arc_mm=4.0):
+    """Parts of the chains that are smooth free-form curves: split at sharp corners and keep a part
+    only if it needs two or more different curved arcs. A groove (one arc between two flat faces,
+    sharp edges) or a bore stays an arc; an ogee or a cove with a lip (arcs flowing into each
+    other) becomes a spline.
+    On the smoothed curve a sharp corner becomes a short, tight arc (about the smoothing window
+    long); a real bend of the part is longer than that. (Corners next to a straight face are cut
+    off before: the chains stop at the verified straight pieces.)"""
+    tol = max(0.25, 0.6 * noise_mm)
+    r_min = max(2.5, 8.0 * noise_mm)  # smoothing window + noise round a sharp corner to about this
+    sag_min = max(0.3, noise_mm)  # on the smoothed curve: the noise is averaged out
+    out = []
+    for ch in chains:
+        # on the smoothed curve (the thin samples of a real scan still zigzag across the band)
+        poly = _smooth_polyline(Y[ch], np.ones((len(ch), 2)))
+        if poly is None:
+            continue
+        Q = poly[0]
+        s_ch = np.r_[0, np.cumsum(np.linalg.norm(np.diff(Y[ch], axis=0), axis=1))]
+        runs, cur = [], []
+        for c, r, i0, i1 in _arc_spline(Q, np.arange(len(Q)), tol):
+            Ls = 0.25 * (i1 - i0 - 1)
+            bent = r < 150.0 and r * (1 - np.cos(min(Ls / r, np.pi) / 2)) >= sag_min
+            if bent and (Ls < min_arc_mm or r < r_min):
+                if cur:
+                    runs.append(cur)  # a corner
+                cur = []
+                continue
+            cur.append((c, r, i0, i1, bent))
+        if cur:
+            runs.append(cur)
+        for run in runs:
+            curved = [(c, r) for c, r, _i0, _i1, bent in run if bent]
+            if len(curved) < 2:
+                continue
+            c0, r0 = curved[0]
+            if all(np.linalg.norm(c_ - c0) < max(1.0, 2 * noise_mm) and abs(r_ - r0) < 0.15 * r0
+                   for c_, r_ in curved[1:]):
+                continue  # one circle split by the greedy cover: an arc
+            ext_ = np.ptp(Q[run[0][2]:run[-1][3]], axis=0)
+            if ext_.min() < max(3.0, 6.0 * noise_mm):
+                continue  # a low step (2 mm pad, 3 mm notch) rounded by the smoothing, not a curve
+            # back to the chain samples (the smoothed curve is resampled every 0.25 mm)
+            j0 = int(np.searchsorted(s_ch, 0.25 * run[0][2]))
+            j1 = int(np.searchsorted(s_ch, 0.25 * (run[-1][3] - 1))) + 1
+            if j1 - j0 >= 5:
+                out.append(ch[j0:j1])
+    return out
+
+
+def _spline_stretches(X, NX, noise_mm, min_support, lines3, near_line, expl, eps, seed=0,
+                      long_mm=6.0, min_len=12.0, min_turn_deg=45.0):
+    """Free-form stretches of the section, seen whole: the section is ordered into chains except
+    where it runs along a long straight edge (a real face); a chain that turns a lot and is not
+    explained by the straight pieces found is one smooth spline curve (a cove, an ogee). Fitting
+    it piece by piece would cut it into short lines and arcs that each fit only a part.
+    Marks the points it explains in expl. Returns [(("poly", P2, N2), weight, None)]."""
+    from scipy.spatial import cKDTree
+    Y, T, Nn, K, S = _curve_samples(X, NX, noise_mm, seed=seed)
+    if len(Y) < 5:
+        return []
+    on_long = np.zeros(len(Y), bool)
+    for (_, n, d), _w, spans in lines3:
+        tdir = np.array([-n[1], n[0]])
+        tq = Y @ tdir
+        for a0, a1 in spans:
+            # every verified straight piece is a face of its own (a groove between two flat
+            # stretches is an arc with sharp edges, not part of a free-form curve)
+            if a1 - a0 >= long_mm:
+                on_long |= (tq > a0 - 0.5) & (tq < a1 + 0.5) & (np.abs(Y @ n + d) < eps)
+    # distance to the straight pieces where they exist (not their infinite lines: a line through a
+    # cove bottom would claim the whole cove)
+    near_span = np.full(len(X), np.inf)
+    for (_, n, d), _w, spans in lines3:
+        tdir = np.array([-n[1], n[0]])
+        tq = X @ tdir
+        ins = np.zeros(len(X), bool)
+        for a0, a1 in spans:
+            ins |= (tq > a0 - 1.0) & (tq < a1 + 1.0)
+        near_span = np.minimum(near_span, np.where(ins, np.abs(X @ n + d), np.inf))
+    tx = cKDTree(X)
+    out = []
+    for ch in _g1_runs(Y, _chains(Y, Nn, np.where(~on_long)[0]), noise_mm):
+        L = float(np.sum(np.linalg.norm(np.diff(Y[ch], axis=0), axis=1)))
+        if L < min_len:
+            continue
+        poly = _smooth_polyline(Y[ch], Nn[ch])
+        if poly is None:
+            continue
+        P2, N2 = poly
+        ang = np.arctan2(N2[:, 1], N2[:, 0])
+        step = max(1, int(round(1.0 / 0.25)))
+        dth = np.diff(np.unwrap(ang[::step]))
+        if np.degrees(np.sum(np.abs(dth))) < min_turn_deg:
+            continue
+        near = np.unique(np.concatenate(tx.query_ball_point(Y[ch], 0.6)))
+        if len(near) < min_support or np.mean(near_span[near] < eps) > 0.6:
+            continue  # mostly the straight edges already found (a pocket, a step)
+        _, jj = cKDTree(P2).query(X[near])
+        res = np.sum((X[near] - P2[jj]) * N2[jj], 1)
+        # (the smoothing window rounds the sharp bends of the stretch a little: some slack)
+        if np.sqrt(np.mean(res ** 2)) > 2.0 * max(noise_mm, 0.15):
+            continue
+        out.append((("poly", P2, N2), float(len(near)), None))
+        expl[near[np.abs(res) < eps]] = True
+    return out
+
+
 def fit_profile(X, NX, noise_mm, min_support, seed=0):
     """Lines and arcs of a 2D section.
 
@@ -317,19 +465,26 @@ def fit_profile(X, NX, noise_mm, min_support, seed=0):
         expl |= inside & (dl < eps) & (NX @ n > np.cos(np.radians(30)))
         near_line = np.minimum(near_line, np.where(inside | True, dl, np.inf))
     out = [(m, w, sp) for m, w, sp in lines3]
+    if SPLINES:
+        out += _spline_stretches(X, NX, noise_mm, min_support, lines3, near_line, expl, eps, seed)
     Xr, NXr = X[~expl], NX[~expl]
     if len(Xr) > 50:
         Y, T, Nn, K, S = _curve_samples(Xr, NXr, noise_mm, seed=seed)
         if len(Y) >= 5:
-            ty = cKDTree(Y)
-            Ks = np.array([np.median(K[nb]) for nb in ty.query_ball_point(Y, 1.0)])
-            curved = np.abs(Ks) >= 0.04
             tx = cKDTree(X)
             tol_s = max(0.25, 0.6 * noise_mm)
-            for ch in _chains(Y, Nn, np.where(curved)[0]):
+            # every remaining stretch of the section, ordered along the curve, covered by arcs
+            # (an arc with a huge radius is a straight piece; free-form stretches were taken whole
+            # before)
+            polys = [m_[1] for m_, _w, _s in out if m_[0] == "poly"]
+            tpoly = cKDTree(np.vstack(polys)) if polys else None
+            for ch in _chains(Y, Nn, np.arange(len(Y))):
                 if np.linalg.norm(Y[ch[-1]] - Y[ch[0]]) < 2.0:
                     continue
-                for c, r, i0, i1 in _arc_spline(Y, ch, tol_s):
+                if tpoly is not None and np.median(tpoly.query(Y[ch])[0]) < 2.0 * eps:
+                    continue  # the left-overs along a spline stretch found whole
+                arcs = [a_ for a_ in _arc_spline(Y, ch, tol_s) if a_[1] < 150.0]
+                for c, r, i0, i1 in arcs:
                     seg = ch[i0:i1]
                     L = np.sum(np.linalg.norm(np.diff(Y[seg], axis=0), axis=1))
                     if L < max(3.0, 1.5 * max(1.5, 3.0 * noise_mm)) or r < max(2.5, 4.0 * noise_mm):
@@ -623,10 +778,93 @@ def _refine(model, Xs, Ns, W, idx, eps, cos30, iters=3):
     return model, inl
 
 
+def _close_end(C, lines, step=0.25, overshoot=4.0, free_len=12.0):
+    """Extension beyond the last sample of the ordered 2D curve C, as samples (step apart), until it
+    has crossed the profile line it joins. lines: [(n, d, spans)] with n.x + d = 0.
+    A curve meeting a face at an angle: straight on along its end tangent. A curve that runs
+    tangentially into a face (it never reaches it along its tangent): toward the point where a
+    tangent join lies, about twice the remaining gap along the face. No face near: the tangent."""
+    E = C[-1]
+    k = min(len(C) - 1, max(4, int(round(3.0 / step))))
+    T = E - C[-1 - k]
+    T /= max(np.linalg.norm(T), 1e-12)
+    best = hit = None
+    for n, d, spans in lines:
+        n = np.asarray(n, float)
+        h = float(n @ E + d)
+        if abs(h) > 6.0:
+            continue
+        t = np.array([-n[1], n[0]])
+        cosT = float(T @ n)
+        # along the tangent the line is reached after L0 = -h / (T.n)
+        L0 = -h / cosT if abs(cosT) > 1e-6 else np.inf
+        if 0 <= L0 <= 4.0 * abs(h) + 3.0:
+            H = E + L0 * T
+            if not spans or any(a0 - 3.0 <= float(H @ t) <= a1 + 3.0 for a0, a1 in spans):
+                if hit is None or L0 < hit:
+                    hit = L0  # the face the curve runs into
+                continue
+        F = E - h * n  # foot on the line
+        if spans:
+            tf = float(F @ t)
+            if not any(a0 - 3.0 <= tf <= a1 + 3.0 for a0, a1 in spans):
+                continue
+        if best is None or abs(h) < abs(best[0]):
+            best = (h, n, d, F, t, spans)
+    if hit is not None:
+        D, L = T, hit + overshoot
+    elif best is None:
+        D, L = T, free_len
+    else:
+        h, n, d, F, t, spans = best
+        if True:
+            # tangent join: aim at F + 2|h| along the line, on the side the curve was heading
+            if t @ T < 0:
+                t = -t
+            G = F + 2.0 * abs(h) * t
+            D = G - E
+            L = float(np.linalg.norm(D)) + overshoot
+            D /= max(np.linalg.norm(D), 1e-12)
+    s_ = np.arange(step, L + 1e-9, step)
+    return E + s_[:, None] * D
+
+
+def _absorb_facets(pr, kp, prims, labels, r_cur, P, N, a, d, eps, noise_mm):
+    """A curved profile surface replaces the flat facets the segmentation used to approximate it:
+    a plane running along the axis whose points nearly all lie on the curve (and face the same
+    way) is a facet, not a face. A real face is not explained by the curve and stays."""
+    from .cadfit import prim_normals
+    n_drop = 0
+    for k, q in enumerate(prims):
+        if q is None or k == kp or q.get("profile") or q["type"] != "plane":
+            continue
+        if abs(q["n"] @ a) > np.sin(np.radians(5)):
+            continue
+        mk = np.where(labels == k)[0]
+        if len(mk) == 0:
+            continue
+        ok = (d[mk] < eps) & (np.sum(prim_normals(pr, P[mk]) * N[mk], axis=1) > np.cos(np.radians(30)))
+        if ok.mean() < 0.85:
+            continue
+        # the curve must fit at least as well as the facet itself (no 1 mm offset fits)
+        r_own = np.abs(r_cur[mk])
+        # (the facet's own rms is biased low: it only kept the points near it)
+        if np.sqrt(np.mean(d[mk][ok] ** 2)) > max(1.1 * np.sqrt(np.mean(r_own[ok] ** 2)) + 0.1,
+                                                  1.2 * noise_mm):
+            continue
+        labels[mk[ok]] = kp
+        r_cur[mk[ok]] = d[mk[ok]]
+        labels[mk[~ok]] = -1
+        r_cur[mk[~ok]] = np.inf
+        prims[k] = None
+        n_drop += 1
+    return n_drop
+
+
 def profile_primitives(P, N, prims, labels, axes, noise_mm, min_pts, P_full=None, N_full=None):
     """Recognise extrusions and add the surfaces of their profiles to the primitive set.
     Returns (prims, labels, findings)."""
-    from .cadfit import _perp_basis, _same_surface, prim_dist, signed_cos, _unit
+    from .cadfit import _perp_basis, _same_surface, prim_dist, signed_cos, _unit, extr_resample
     findings = []
     ex = find_extrusions(P, N, axes, noise_mm)
     eps = max(2.0 * noise_mm, 0.8)
@@ -667,6 +905,25 @@ def profile_primitives(P, N, prims, labels, axes, noise_mm, min_pts, P_full=None
                 tdir2 = np.array([-model[1][1], model[1][0]])
                 new3d.append({"type": "plane", "n": _unit(n3), "d": float(model[2]) / np.linalg.norm(n3),
                               "_t3": tdir2[0] * u + tdir2[1] * v, "_spans": spans})
+            elif model[0] == "poly":
+                P2, N2 = model[1], model[2]
+                # the smoothing window bends the last ~2 mm of each end: drop them, the closing
+                # extension takes over there
+                cut = int(round(2.0 / 0.25))
+                if len(P2) > 4 * cut:
+                    P2, N2 = P2[cut:-cut], N2[cut:-cut]
+                lines2 = [(m_[1], m_[2], s_) for m_, _w, s_ in p2d if m_[0] == "line"]
+                # each end runs on until it crosses the flat face it joins (the lines took the last
+                # millimetres of a curve that runs tangentially into a face); a dangling end would
+                # leave the curved surface unable to cut the part
+                e0 = _close_end(P2[::-1], lines2)
+                e1 = _close_end(P2, lines2)
+                ext = np.r_[e0[::-1][::4], P2[::2], e1[::4]]
+                Pd = np.r_[e0[::-1], P2, e1]
+                Nd = np.r_[np.repeat(N2[:1], len(e0), 0), N2, np.repeat(N2[-1:], len(e1), 0)]
+                pr_e = {"type": "extrusion", "a": a.copy(), "u": u.copy(), "v": v.copy(),
+                        "poly": Pd, "pnrm": Nd, "poly_ext": ext}
+                new3d.append(extr_resample(pr_e))  # distances measured to the very curve of the face
             else:
                 c = model[1]
                 new3d.append({"type": "cylinder", "a": a.copy(), "p": c[0] * u + c[1] * v + a * e["t0"],
@@ -725,7 +982,9 @@ def profile_primitives(P, N, prims, labels, axes, noise_mm, min_pts, P_full=None
             r_cur[win] = d[win]
             prims.append(pr)
             n_new += 1
-            n_arc += pr["type"] == "cylinder"
+            n_arc += pr["type"] in ("cylinder", "extrusion")
+            if pr["type"] in ("cylinder", "extrusion"):
+                n_drop += _absorb_facets(pr, len(prims) - 1, prims, labels, r_cur, P, N, a, d, eps, noise_mm)
         names = "xyz"
         ai = int(np.argmax(np.abs(a)))
         findings.append({"axis": a.tolist(), "length_mm": e["length"], "fraction": e["frac"],
@@ -735,7 +994,7 @@ def profile_primitives(P, N, prims, labels, axes, noise_mm, min_pts, P_full=None
             log(f"  CAD: {n_drop} oppervlak(ken) langs het profiel die niet in de doorsnede passen vervallen")
         log(f"  CAD: bevinding: profiel langs {names[ai]} over {e['length']:.0f} mm "
             f"({e['frac'] * 100:.0f}% van de oppervlakte, doorsnede {e['consistency'] * 100:.0f}% gelijk over de lengte); "
-            f"{len(p2d)} lijnen/bogen in de doorsnede, {n_new} nieuwe oppervlakken ({n_arc} boog)")
+            f"{len(p2d)} lijnen/bogen in de doorsnede, {n_new} nieuwe oppervlakken ({n_arc} gebogen)")
     # remove the dropped primitives, renumber the labels
     keep = [k for k, q in enumerate(prims) if q is not None]
     remap = -np.ones(len(prims) + 1, int)

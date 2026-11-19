@@ -90,6 +90,30 @@ def case_cove_block():
     return s
 
 
+def case_ogee_block():
+    """Block 100 x 60 x 50 with a freeform S-shaped (ogee) moulding along x on the top front edge:
+    the profile is a smooth spline, neither a line nor one arc."""
+    from OCP.gp import gp_Pnt, gp_Vec
+    from OCP.OCP.collections import Array1_gp_Pnt as TColgp_Array1OfPnt
+    from OCP.GeomAPI import GeomAPI_PointsToBSpline
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeWire, BRepBuilderAPI_MakeFace
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakePrism
+    ys = np.linspace(60.0, 40.0, 41)
+    zs = 40.0 - 10.0 * np.cos(np.pi * (60.0 - ys) / 20.0)
+    arr = TColgp_Array1OfPnt(1, len(ys))
+    for i, (y, z) in enumerate(zip(ys, zs)):
+        arr.SetValue(i + 1, gp_Pnt(0.0, float(y), float(z)))
+    from OCP.GeomAbs import GeomAbs_C2
+    spl = GeomAPI_PointsToBSpline(arr, 3, 8, GeomAbs_C2, 1e-4).Curve()
+    w = BRepBuilderAPI_MakeWire()
+    pts = [(40, 50), (0, 50), (0, 0), (60, 0), (60, 30)]
+    for (y0, z0), (y1, z1) in zip(pts[:-1], pts[1:]):
+        w.Add(BRepBuilderAPI_MakeEdge(gp_Pnt(0, y0, z0), gp_Pnt(0, y1, z1)).Edge())
+    w.Add(BRepBuilderAPI_MakeEdge(spl).Edge())
+    f = BRepBuilderAPI_MakeFace(w.Wire()).Face()
+    return BRepPrimAPI_MakePrism(f, gp_Vec(100, 0, 0)).Shape()
+
+
 def case_tslot_rail():
     """Aluminium 40x40 T-slot profile, 120 long, lying on the floor: slot opening 8 wide / 3 deep,
     cavity 16 wide / 4 deep behind it (an undercut), on the top and both sides; centre bore r 4.2."""
@@ -166,7 +190,7 @@ def case_tilted_tool_block():
 
 
 CASES = {"box": case_box, "tool_block": case_tool_block, "real_block": case_real_block,
-         "cove_block": case_cove_block, "tslot_rail": case_tslot_rail, "bracket": case_bracket,
+         "cove_block": case_cove_block, "ogee_block": case_ogee_block, "tslot_rail": case_tslot_rail, "bracket": case_bracket,
          "shallow": case_shallow, "zprofile": case_zprofile, "offframe": case_offframe,
          "tilted_tool_block": case_tilted_tool_block, "ghost_box": case_box, "ghost_tool_block": case_tool_block}
 
@@ -313,6 +337,24 @@ def _area_samples(V, T, step):
     return S
 
 
+def read_back(path):
+    """The STEP read in like a CAD program does it (standard healing when the checker objects)."""
+    from OCP.STEPControl import STEPControl_Reader
+    from OCP.BRepCheck import BRepCheck_Analyzer
+    from OCP.ShapeFix import ShapeFix_Shape
+    r = STEPControl_Reader()
+    r.ReadFile(str(path))
+    r.TransferRoots()
+    rs = r.OneShape()
+    if not BRepCheck_Analyzer(rs).IsValid():
+        fx = ShapeFix_Shape(rs)
+        fx.SetPrecision(1e-4)
+        fx.SetMaxTolerance(1e-2)
+        fx.Perform()
+        rs = fx.Shape()
+    return rs
+
+
 def run(noise=0.5, names=None, out_dir=Path("cad_gauntlet_out"), seeds=(0,)):
     out_dir.mkdir(exist_ok=True)
     results = {}
@@ -324,10 +366,12 @@ def run(noise=0.5, names=None, out_dir=Path("cad_gauntlet_out"), seeds=(0,)):
             P, N, cams = simulate_scan(truth, noise, seed=seed, ghost=name.startswith("ghost"))
             # the pipeline's noise estimate is low; give 60% of the truth like it would
             shape, info = cadfit.reconstruct(P, cams, noise_mm=0.6 * noise, floor_z=0.0, normals=None)
-            g = grade(shape, truth, P, cams)
-            g.update({k: v for k, v in info.items() if isinstance(v, (int, float, str, bool))})
-            ok, how, _ = cadfit.export_solid(out_dir / f"{name}_s{seed}.step", name, shape, (0.6, 0.6, 0.7),
+            path = out_dir / f"{name}_s{seed}.step"
+            ok, how, _ = cadfit.export_solid(path, name, shape, (0.6, 0.6, 0.7),
                                              ref_volume=info.get("cells_volume"))
+            # grade what the user gets: the STEP as a CAD program reads it in
+            g = grade(read_back(path) if ok else shape, truth, P, cams)
+            g.update({k: v for k, v in info.items() if isinstance(v, (int, float, str, bool))})
             g["export"] = how
             g["pass"] = bool(g["pass"] and ok)
         except Exception as e:  # a crash is a failed case, not a crashed gauntlet

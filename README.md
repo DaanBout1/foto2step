@@ -199,6 +199,10 @@ Delen handmatig afbakenen (ook met maar 1 stand): `motion: manual_bodies: [{name
      coördinaat-histogrammen, bogen uit de kromming langs de dunne doorsnede). Elke lijn wordt een vlak en elke
      boog een cilinder langs die as; ze gaan mee in dezelfde solid-opbouw, zodat een deel een profiel in één
      richting kan zijn met gaten of lippen in een andere. De bevinding staat in het log en het rapport.
+     Een stuk doorsnede dat vloeiend van de ene boog in de andere overgaat (ojief, holle kamer met lip) wordt
+     als geheel één vrije kromme (spline) en in 3D een geëxtrudeerd spline-vlak; een groef met scherpe randen
+     blijft een cilinder. De uiteinden van de spline lopen door tot ze het aansluitende vlak snijden, en de
+     platte facetten die eerst die kromme benaderden vervallen.
      (Zo werkt ook de gangbare scan-naar-CAD-software: eerst gebieden herkennen, dan extruderen/wentelen.)
    * vlakken en cilinders gezocht (RANSAC), samengevoegd, recht gezet op het assenstelsel van het onderdeel
      (evenwijdig/haaks), opnieuw gefit op duizenden punten: de ruis middelt weg;
@@ -218,7 +222,7 @@ Delen handmatig afbakenen (ook met maar 1 stand): `motion: manual_bodies: [{name
 ### CAD-gauntlet (`python tests/cad_gauntlet.py 0.5`)
 Onderdelen met exact bekende maten, gesimuleerde scan (ruis + golvende ruis + 1% uitschieters, alleen wat ≥2
 camera's zien, onderkant nooit gezien, ruis te laag opgegeven). Beoordeeld op de **99,9%-afwijking** over het
-geziene oppervlak (ongeziene delen apart gerapporteerd):
+geziene oppervlak, op de STEP zoals een CAD-programma hem inleest (ongeziene delen apart gerapporteerd):
 
 | Onderdeel (0,5 mm ruis) | Resultaat | 99,9% afwijking |
 |---|---|---|
@@ -232,7 +236,8 @@ geziene oppervlak (ongeziene delen apart gerapporteerd):
 | Blok met spiegel-dubbellaag (2,5 mm) | geslaagd, 6/6 vlakken | 0,06 mm |
 | Gereedschapsblok met spiegel-dubbellaag | geslaagd, 23/23 vlakken | 0,19 mm |
 | Echt blok nagebouwd (3 diepe groeven r 13, 2 lippen achter) | geslaagd, 0,5 mm én 0,7 mm ruis | 0,45 / 0,34 mm |
-| Blok met holle kamers, lippen en ondersnijdingen (zoals op de foto's) | **nog niet**: 73 vlakken, blind gat wordt doorgezet | 3,0 / 13 mm |
+| Blok met vrije S-vormige (ojief) rand langs de lengte | geslaagd, 7/7 vlakken (1 spline-vlak) | 0,43 mm |
+| Blok met holle kamers, lippen en ondersnijdingen (zoals op de foto's) | **nog niet**: ondersnijdingen achter een spleet van 1,5 mm niet gezien | 3,0 / 1,1 mm |
 | Aluminium T-sleufprofiel 40×40 (ondersnijdingen) | **nog niet**: sleufkamers niet gezien | 4,1 / 2,0 mm |
 
 Groeven, boringen en nokken langs de assen van het deel worden apart gezocht over álle punten (as vast op het

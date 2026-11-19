@@ -352,3 +352,38 @@ def test_strict_fusion_removes_reflection_layer(tmp_path):
                                                            "max_violation_frac": 99, "rel_depth": 0.05,
                                                            "voxel_mm": 1.0})
     assert np.mean(np.abs(L[:, 2]) > 2.0) > 0.01
+
+
+def test_profile_spline_stretch_and_closed_ends():
+    """An S-shaped (ogee) edge between two flat faces of a section becomes one spline stretch whose
+    ends are carried on until they cross the faces they join."""
+    from foto2step import profiles
+    rng = np.random.default_rng(0)
+    pts, nrm = [], []
+    for y in np.arange(0, 40, 0.05):                     # top face z = 50 (outward +z)
+        pts.append((y, 50.0)); nrm.append((0, 1))
+    for z in np.arange(0, 30, 0.05):                     # front face y = 60 (outward +y)
+        pts.append((60.0, z)); nrm.append((1, 0))
+    for y in np.arange(40, 60, 0.02):                    # ogee z = 40 - 10 cos(pi (60 - y) / 20)
+        z = 40.0 - 10.0 * np.cos(np.pi * (60.0 - y) / 20.0)
+        dz = -10.0 * np.pi / 20.0 * np.sin(np.pi * (60.0 - y) / 20.0)
+        n = np.array([-dz, 1.0]) / np.hypot(dz, 1.0)
+        pts.append((y, z)); nrm.append(tuple(n))
+    X = np.array(pts, float)
+    NX = np.array(nrm, float)
+    X += rng.normal(0, 0.15, X.shape) * NX
+    out = profiles.fit_profile(X, NX, 0.15, min_support=40)
+    polys = [m for m, _w, _s in out if m[0] == "poly"]
+    assert len(polys) == 1
+    P2 = polys[0][1]
+    # on the curve (away from the smoothed ends)
+    mid = P2[len(P2) // 4: 3 * len(P2) // 4]
+    zt = 40.0 - 10.0 * np.cos(np.pi * (60.0 - mid[:, 0]) / 20.0)
+    assert np.max(np.abs(mid[:, 1] - zt)) < 0.4
+    lines = [(m[1], m[2], s) for m, _w, s in out if m[0] == "line"]
+    end = profiles._close_end(P2, lines)
+    beg = profiles._close_end(P2[::-1], lines)
+    # one end crosses the top face (z = 50), the other the front face (y = 60)
+    zs = np.r_[end[:, 1], beg[:, 1]]
+    ys = np.r_[end[:, 0], beg[:, 0]]
+    assert zs.max() > 50.0 and ys.max() > 60.0
