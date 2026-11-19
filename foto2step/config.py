@@ -44,6 +44,7 @@ DEFAULTS = {
         "resolution_level": 0,    # 0 = volle resolutie (traag maar nauwkeurig), 1 = half
         "max_resolution": 4096,
         "number_views_fuse": 3,
+        "strict_fusion": True,    # CAD-route: dieptekaarten opnieuw streng samenvoegen (tegen reflecties)
     },
     "mesh": {
         "voxel_mm": 1.0,          # puntenwolk-uitdunning

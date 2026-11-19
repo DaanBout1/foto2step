@@ -188,6 +188,10 @@ Delen handmatig afbakenen (ook met maar 1 stand): `motion: manual_bodies: [{name
    met namen en kleuren, teruggelezen en gecontroleerd.
 8. **CAD-reconstructie** (`export.cad: auto`, standaard aan): in plaats van driehoekjes een échte solid uit
    gefitte vlakken en cilinders, zoals je hem zelf in CAD zou tekenen:
+   * eerst worden de dieptekaarten van OpenMVS voor dit deel opnieuw en streng samengevoegd (`dense.strict_fusion`):
+     een punt telt alleen als minstens 3 andere camera's met echte basislijn hetzelfde oppervlak zagen, en geen
+     camera er dwars doorheen keek (reflectie-spook). Op het test_01-blok: vlakruis 0,48 → 0,27 mm, spiegellaag
+     en waaiers van strepen weg;
    * normalen gericht met een zichtbaarheidstest (stralen naar de camera's), ruis gemeten uit de scan zelf;
    * vlakken en cilinders gezocht (RANSAC), samengevoegd, recht gezet op het assenstelsel van het onderdeel
      (evenwijdig/haaks), opnieuw gefit op duizenden punten: de ruis middelt weg;

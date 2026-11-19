@@ -376,6 +376,21 @@ class Pipeline:
             cams = self._cams(self.states[0])
             C = np.array([c[2] for c in cams])
             floor_z = 0.0 if (b.get("static") and self.cfg["mesh"].get("remove_floor", True)) else None
+            sf = self.cfg["dense"].get("strict_fusion", True)
+            if sf not in (False, "false", "nee"):
+                # the CAD fit works on the strictly re-fused depth maps (no reflection ghosts / fans)
+                from .fusion import strict_points
+                d0 = self.sdir(self.states[0])
+                try:
+                    sp = strict_points(d0 / "dense", pts, d0 / "fusion" / name,
+                                       params=sf if isinstance(sf, dict) else None,
+                                       zmin=float(pts[:, 2].min()) - 0.5 if floor_z is not None else None)
+                except Exception as e:
+                    log(f"  strikte fusie mislukt ({e!r}); de gewone puntenwolk wordt gebruikt")
+                    sp = None
+                if sp is not None and len(sp) >= 0.3 * len(pts):
+                    pts = sp
+                    noise = 0.0  # let the CAD fit measure it on these points
             log(f"  CAD-reconstructie (vlakken + cilinders -> solid)")
             shape, info = cadfit.reconstruct(pts, C, noise_mm=max(noise, 0.2), floor_z=floor_z)
             q = cadfit.quality(shape, pts, max(noise, info.get("noise_mm", 0.0)), floor_z)

@@ -298,3 +298,57 @@ def test_cadfit_noisy_box_becomes_6_face_solid():
     rep = shape_report(shape)
     assert info["closed"] and rep["valid"] and rep["solid"] and rep["faces"] == 6
     assert abs(rep["volume_mm3"] - 100 * 60 * 80) / (100 * 60 * 80) < 0.005
+
+
+def _write_dmap(fn, K, R, C, D, Nrm, ids, w, h):
+    import struct
+    with open(fn, "wb") as f:
+        f.write(struct.pack("<HBBIIIIff", 0x5244, 1 | 2 | 4, 0, w, h, w, h, 1.0, 1e4))
+        name = b"img.jpg"
+        f.write(struct.pack("<H", len(name)) + name)
+        f.write(struct.pack("<I", len(ids)) + struct.pack("<%dI" % len(ids), *ids))
+        f.write(K.astype("<f8").tobytes() + R.astype("<f8").tobytes() + C.astype("<f8").tobytes())
+        f.write(D.astype("<f4").tobytes() + Nrm.astype("<f4").tobytes() + np.ones_like(D, "<f4").tobytes())
+
+
+def test_strict_fusion_removes_reflection_layer(tmp_path):
+    """Plane z=0 seen by 8 cameras; in 2 of them the depth shows a reflection 4 mm in front of it.
+    Strict fusion keeps the plane (with less noise than one depth map) and drops the ghost."""
+    from foto2step.fusion import strict_points
+    rng = np.random.default_rng(0)
+    w, h, f = 160, 120, 300.0
+    K = np.array([[f, 0, (w - 1) / 2], [0, f, (h - 1) / 2], [0, 0, 1.0]])
+    dd = tmp_path / "dense"
+    dd.mkdir()
+    for i in range(8):
+        a = 2 * np.pi * i / 8
+        C = np.array([150 * np.cos(a), 150 * np.sin(a), 300.0])
+        zc = -C / np.linalg.norm(C)
+        xc = np.cross([0, 0, 1.0], zc); xc /= np.linalg.norm(xc)
+        yc = np.cross(zc, xc)
+        R = np.stack([xc, yc, zc])
+        vv, uu = np.mgrid[0:h, 0:w]
+        ray = np.c_[uu.ravel(), vv.ravel(), np.ones(uu.size)] @ np.linalg.inv(K).T @ R  # world dirs (unnorm, z_cam=1)
+        t = -C[2] / ray[:, 2]                          # hit z = 0; t equals camera depth (z_cam scale 1)
+        D = (t + rng.normal(0, 0.3, t.size)).reshape(h, w)
+        if i in (0, 4):                                # reflection: 4 mm closer over the centre patch
+            X = C + ray * t[:, None]
+            ghost = (np.abs(X[:, 0]) < 15) & (np.abs(X[:, 1]) < 15)
+            Df = D.ravel()
+            Df[ghost] -= 4.0                           # 4 mm closer to the camera
+            D = Df.reshape(h, w)
+        Nrm = np.tile(R @ np.array([0, 0, 1.0]), (h * w, 1)).reshape(h, w, 3)
+        ids = [i + 1] + [j + 1 for j in range(8) if j != i]
+        _write_dmap(dd / f"depth{i + 1:04d}.dmap", K, R, C, D, Nrm, ids, w, h)
+    body = np.c_[rng.uniform(-30, 30, (4000, 2)), np.zeros(4000)]
+    P = strict_points(dd, body, tmp_path / "cache", params={"min_baseline_deg": 5.0, "voxel_mm": 1.0})
+    assert P is not None and len(P) > 1000
+    assert np.mean(np.abs(P[:, 2]) > 2.0) < 0.002     # the ghost layer is gone
+    assert np.std(P[:, 2]) < 0.3                       # fused noise below one map's 0.3 mm
+    # control: with the two reflecting views agreeing with each other only, a loose fusion keeps it
+    import shutil
+    shutil.rmtree(tmp_path / "cache")
+    L = strict_points(dd, body, tmp_path / "cache", params={"min_views": 1, "min_baseline_deg": 0.0,
+                                                           "max_violation_frac": 99, "rel_depth": 0.05,
+                                                           "voxel_mm": 1.0})
+    assert np.mean(np.abs(L[:, 2]) > 2.0) > 0.01
