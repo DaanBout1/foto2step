@@ -2195,6 +2195,21 @@ def reconstruct(P, cams, noise_mm, floor_z=0.0, normals=None, voxel=None, log_fn
                 shape, rep, prims = shape2, rep2, keep_p
         except Exception as e:  # the first solution stands
             log_fn(f"  CAD: vereenvoudiging mislukt ({e}); eerste oplossing blijft")
+    if any(p["type"] == "extrusion" for p in prims):
+        from OCP.BRepCheck import BRepCheck_Analyzer
+        if not BRepCheck_Analyzer(shape).IsValid():
+            # a free-form surface can cut a flat face into a boundary OCC rejects; a valid solid
+            # without the spline beats an invalid one with it
+            log_fn("  CAD: solid met vrije-kromme-vlak ongeldig; opnieuw opgelost zonder vrije krommen")
+            keep_p = [p for p in prims if p["type"] != "extrusion"]
+            try:
+                shape2, rep2 = cell_solid(keep_p, Pd, occ, floor_z=floor_z, noise_mm=noise_mm, smooth=smooth,
+                                          floor_plane=floor_plane, N=Nd, cams=cams)
+                shape2 = clean_solid(shape2)
+                if BRepCheck_Analyzer(shape2).IsValid():
+                    shape, rep, prims = shape2, rep2, keep_p
+            except Exception as e:
+                log_fn(f"  CAD: oplossen zonder vrije krommen mislukt ({e})")
     info = {"findings": getattr(reconstruct, "findings", []),
             "surfaces": len(prims), "cells": rep["cells"], "inside": rep["inside"],
             "ambiguous": rep["ambiguous_cells"], "oriented": dec, "explained": float(np.mean(lab >= 0)),
