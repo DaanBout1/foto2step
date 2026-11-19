@@ -193,6 +193,13 @@ Delen handmatig afbakenen (ook met maar 1 stand): `motion: manual_bodies: [{name
      camera er dwars doorheen keek (reflectie-spook). Op het test_01-blok: vlakruis 0,48 → 0,27 mm, spiegellaag
      en waaiers van strepen weg;
    * normalen gericht met een zichtbaarheidstest (stralen naar de camera's), ruis gemeten uit de scan zelf;
+   * **eerste bevinding: is het deel (deels) een profiel?** Per as van het deel: liggen de normalen van een groot
+     deel van het oppervlak loodrecht op die as, en is de doorsnede over de lengte gelijk? Dan worden alle punten
+     over de hele lengte op één doorsnede gelegd en daarin lijnen en bogen gefit (rechte randen uit
+     coördinaat-histogrammen, bogen uit de kromming langs de dunne doorsnede). Elke lijn wordt een vlak en elke
+     boog een cilinder langs die as; ze gaan mee in dezelfde solid-opbouw, zodat een deel een profiel in één
+     richting kan zijn met gaten of lippen in een andere. De bevinding staat in het log en het rapport.
+     (Zo werkt ook de gangbare scan-naar-CAD-software: eerst gebieden herkennen, dan extruderen/wentelen.)
    * vlakken en cilinders gezocht (RANSAC), samengevoegd, recht gezet op het assenstelsel van het onderdeel
      (evenwijdig/haaks), opnieuw gefit op duizenden punten: de ruis middelt weg;
    * kleine details (verzinkboring, korte naaf) apart gezocht met vlakken/cilinders op het assenstelsel van het deel;
@@ -225,6 +232,8 @@ geziene oppervlak (ongeziene delen apart gerapporteerd):
 | Blok met spiegel-dubbellaag (2,5 mm) | geslaagd, 6/6 vlakken | 0,06 mm |
 | Gereedschapsblok met spiegel-dubbellaag | geslaagd, 23/23 vlakken | 0,19 mm |
 | Echt blok nagebouwd (3 diepe groeven r 13, 2 lippen achter) | geslaagd, 0,5 mm én 0,7 mm ruis | 0,45 / 0,34 mm |
+| Blok met holle kamers, lippen en ondersnijdingen (zoals op de foto's) | **nog niet**: 73 vlakken, blind gat wordt doorgezet | 3,0 / 13 mm |
+| Aluminium T-sleufprofiel 40×40 (ondersnijdingen) | **nog niet**: sleufkamers niet gezien | 4,1 / 2,0 mm |
 
 Groeven, boringen en nokken langs de assen van het deel worden apart gezocht over álle punten (as vast op het
 assenstelsel, alleen middelpunt en straal gefit), zodat ze bij ~0,7 mm ruis niet meer als trap van vlakken

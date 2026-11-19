@@ -1953,6 +1953,7 @@ def reconstruct(P, cams, noise_mm, floor_z=0.0, normals=None, voxel=None, log_fn
         log_fn(f"  CAD: ruis uit vlakfit {est:.2f} mm (opgegeven {noise_mm:.2f} mm)")
         noise_mm = max(noise_mm, est)
     voxel = voxel or max(0.5, 1.2 * noise_mm)
+    P_full = np.asarray(pc.points).copy()  # all points: the profile fit averages over all of them
     pc = pc.voxel_down_sample(voxel)
     r_n = max(3.0, 5 * voxel)
     dens = len(pc.points) / max(1e-9, _approx_area(np.asarray(pc.points), voxel))
@@ -1988,12 +1989,20 @@ def reconstruct(P, cams, noise_mm, floor_z=0.0, normals=None, voxel=None, log_fn
         Ns, dec = _normals(Ps)
         Pd, Nd = Ps, Ns  # Pd/Ps are the same set here
         prims, lab = _segment(Ps, Ns)
-    prims, lab = frame_cylinders(prims, lab, Ps, Ns, noise_mm, min_pts)
+    # first finding about the part: is it (partly) a constant profile along one of its axes?
+    from .profiles import profile_primitives
+    dfull, ifull = cKDTree(Ps).query(P_full, distance_upper_bound=1.5 * voxel)
+    okf = np.isfinite(dfull)  # (ghost layers and outliers removed from Ps are dropped here too)
+    prims, lab, findings = profile_primitives(Ps, Ns, prims, lab, _frame_axes(prims), noise_mm, min_pts,
+                                              P_full=P_full[okf], N_full=Ns[ifull[okf]])
+    reconstruct.findings = findings
+    auth = [np.asarray(f["axis"]) for f in findings if f.get("authority")]  # empty unless AUTHORITY
+    prims, lab = frame_cylinders(prims, lab, Ps, Ns, noise_mm, min_pts, skip_axes=auth)
     prims, lab = prune_redundant(prims, lab, Ps, noise_mm, N=Ns)
     prims = refine_primitives(prims, lab, Ps, Ns, noise_mm, oriented=True)
     prims, lab = merge_similar(prims, lab, Ps, noise_mm)  # snapping can make planes coincide
     prims, lab = split_false_chamfers(prims, lab, Ps, Ns, noise_mm)
-    prims, lab = detail_primitives(prims, lab, Ps, Ns, noise_mm, min_pts)
+    prims, lab = detail_primitives(prims, lab, Ps, Ns, noise_mm, min_pts, skip_axes=auth)
     log_fn(f"  CAD: {len(prims)} oppervlakken ({sum(p['type'] == 'plane' for p in prims)} vlak, "
            f"{sum(p['type'] == 'cylinder' for p in prims)} cilinder), {np.mean(lab >= 0):.0%} van de punten verklaard")
     Ns, n_flip = harmonize_normals(prims, lab, Ps, Ns, noise_mm)
@@ -2046,7 +2055,8 @@ def reconstruct(P, cams, noise_mm, floor_z=0.0, normals=None, voxel=None, log_fn
                 shape, rep, prims = shape2, rep2, keep_p
         except Exception as e:  # the first solution stands
             log_fn(f"  CAD: vereenvoudiging mislukt ({e}); eerste oplossing blijft")
-    info = {"surfaces": len(prims), "cells": rep["cells"], "inside": rep["inside"],
+    info = {"findings": getattr(reconstruct, "findings", []),
+            "surfaces": len(prims), "cells": rep["cells"], "inside": rep["inside"],
             "ambiguous": rep["ambiguous_cells"], "oriented": dec, "explained": float(np.mean(lab >= 0)),
             "noise_mm": float(noise_mm), "cells_volume": rep.get("cells_volume"),
             "t": time.time() - t0}
@@ -2148,7 +2158,7 @@ def _verify_frame_cylinder(P, N, a, c, r, idx, r_cur, noise_mm, eps, link, min_p
     return pr, win, "ok"
 
 
-def frame_cylinders(prims, labels, P, N, noise_mm, min_pts, max_new=12, n_hyp=500, seed=0):
+def frame_cylinders(prims, labels, P, N, noise_mm, min_pts, max_new=12, n_hyp=500, seed=0, skip_axes=()):
     """Grooves, bores and bosses along the part's own axes, searched over ALL points.
 
     At ~0.7 mm noise the PCA normals over a 5 mm neighbourhood smear a groove of r = 8 mm, so the
@@ -2157,7 +2167,8 @@ def frame_cylinders(prims, labels, P, N, noise_mm, min_pts, max_new=12, n_hyp=50
     the part's edges), so only centre and radius are fitted, from 3 positions; normals only need to
     agree loosely. A candidate is scored by how much better it explains points than their current
     surface; the points it wins move to the cylinder, and planes left without points are pruned."""
-    axes = _frame_axes(prims)
+    # along an axis whose profile was recognised, the profile alone decides the surfaces
+    axes = [a for a in _frame_axes(prims) if not any(abs(a @ b) > 0.999 for b in skip_axes)]
     if not axes:
         return prims, labels
     rng = np.random.default_rng(seed)
@@ -2365,7 +2376,7 @@ def harmonize_normals(prims, labels, P, N, noise_mm):
     return N, n_flip
 
 
-def detail_primitives(prims, labels, P, N, noise_mm, min_pts, max_new=12, seed=0):
+def detail_primitives(prims, labels, P, N, noise_mm, min_pts, max_new=12, seed=0, skip_axes=()):
     """Small features (a counterbore 8 mm wide and 5 mm deep, a short boss) are lost by the main
     segmentation: their PCA normals are blended with the neighbouring faces, so the normal-guided
     RANSAC never collects enough agreeing points. Here the unexplained clusters are fitted with
@@ -2403,13 +2414,18 @@ def detail_primitives(prims, labels, P, N, noise_mm, min_pts, max_new=12, seed=0
             Q, NQ = P[idx], N[idx]
             best = None
             for a in axes:
+                in_profile = any(abs(a @ b) < 0.01 for b in skip_axes)  # plane running along a profile
                 t = Q @ a
                 along = np.abs(NQ @ a) > cos45
+                if in_profile:
+                    along = np.zeros(len(Q), bool)
                 for t0 in rng.choice(t[along], min(40, int(along.sum())), replace=False) if along.any() else []:
                     ok = along & (np.abs(t - t0) < eps)
                     if best is None or ok.sum() > best[0]:
                         t1 = float(np.median(t[ok]))
                         best = (int(ok.sum()), {"type": "plane", "n": a.copy(), "d": -t1})
+                if any(abs(a @ b) > 0.999 for b in skip_axes):
+                    continue  # cylinders along a recognised profile come from the profile only
                 u, v = _perp_basis(a)
                 X = np.c_[Q @ u, Q @ v]
                 across = np.abs(NQ @ a) < np.sin(np.radians(45))

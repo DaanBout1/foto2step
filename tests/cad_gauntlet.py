@@ -75,6 +75,37 @@ def case_real_block():
     return s
 
 
+def case_cove_block():
+    """The test_01 block as the photos show it: front (y = 63) with three wide concave coves (r 11.3),
+    a lip above each and a 1.5 mm undercut slot under each lip (not visible from above), two lugs
+    at the back and a 5 mm hole in the top. The whole front is one profile along x."""
+    s = _box(0, 0, 0, 105, 63, 90)
+    for x0 in (33.0, 82.0):
+        s = _fuse(s, _box(x0, -14, 0, x0 + 17, 0.5, 90))
+    for k in range(3):
+        zk = 2.0 + 29.0 * k
+        s = _cut(s, _cyl((-1, 64.5, zk + 15.0), (1, 0, 0), 11.3, 107))
+        s = _cut(s, _box(-1, 57.0, zk + 26.0, 106, 64, zk + 27.5))
+    s = _cut(s, _cyl((52, 45, 75), (0, 0, 1), 2.5, 16))
+    return s
+
+
+def case_tslot_rail():
+    """Aluminium 40x40 T-slot profile, 120 long, lying on the floor: slot opening 8 wide / 3 deep,
+    cavity 16 wide / 4 deep behind it (an undercut), on the top and both sides; centre bore r 4.2."""
+    s = _box(0, 0, 0, 120, 40, 40)
+    for side in ("top", "y0", "y1"):
+        if side == "top":
+            op, cav = _box(-1, 16, 37, 121, 24, 41), _box(-1, 12, 33, 121, 28, 37)
+        elif side == "y0":
+            op, cav = _box(-1, -1, 16, 121, 3, 24), _box(-1, 3, 12, 121, 7, 28)
+        else:
+            op, cav = _box(-1, 37, 16, 121, 41, 24), _box(-1, 33, 12, 121, 37, 28)
+        s = _cut(_cut(s, op), cav)
+    s = _cut(s, _cyl((-1, 20, 20), (1, 0, 0), 4.2, 122))
+    return s
+
+
 def case_bracket():
     """L-bracket with a boss and a through hole: plane + cylinder interplay."""
     s = _fuse(_box(0, 0, 0, 120, 50, 12), _box(0, 0, 0, 14, 50, 70))
@@ -134,7 +165,8 @@ def case_tilted_tool_block():
     return _tilted(case_tool_block(), 2.0)
 
 
-CASES = {"box": case_box, "tool_block": case_tool_block, "real_block": case_real_block, "bracket": case_bracket,
+CASES = {"box": case_box, "tool_block": case_tool_block, "real_block": case_real_block,
+         "cove_block": case_cove_block, "tslot_rail": case_tslot_rail, "bracket": case_bracket,
          "shallow": case_shallow, "zprofile": case_zprofile, "offframe": case_offframe,
          "tilted_tool_block": case_tilted_tool_block, "ghost_box": case_box, "ghost_tool_block": case_tool_block}
 

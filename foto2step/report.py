@@ -151,14 +151,19 @@ def write_report(work: Path, out: Path, cfg: dict, states: list):
     if cads:
         a("<h2>CAD-reconstructie (gefitte vlakken en cilinders)</h2><div class='panel'><table><tr><th>Deel</th>"
           "<th>Resultaat</th><th>Solid-vlakken</th><th>Gefitte oppervlakken</th><th>Afwijking scan-&gt;solid mediaan / 95%</th>"
-          "<th>Punten verklaard</th></tr>")
+          "<th>Punten verklaard</th><th>Bevinding</th></tr>")
         for p in cads:
             c = p["cad"]
+            fnd = "; ".join(
+                f"profiel langs {'xyz'[int(np.argmax(np.abs(f['axis'])))]} over {f['length_mm']:.0f} mm "
+                f"({f['consistency'] * 100:.0f}% gelijk)" for f in c.get("findings", []) if f.get("consistency", 0) >= 0.9
+            ) or "-"
             res = (f"<b>CAD-solid gebruikt</b> ({html.escape(str(c.get('geometry', '')))})" if c.get("accepted") else
                    f"<span class=warn>mesh gebruikt</span> ({html.escape(str(c.get('reason', '')))})")
             dev = (f"{_r(c['dev_median'])} / {_r(c.get('dev_p98', c.get('dev_p95', 0)))} mm (98%)" if "dev_median" in c else "-")
             a(f"<tr><td>{html.escape(p['name'])}</td><td>{res}</td><td>{c.get('faces', '-')}</td>"
-              f"<td>{c.get('surfaces', '-')}</td><td>{dev}</td><td>{c.get('explained', 0) * 100:.0f}%</td></tr>")
+              f"<td>{c.get('surfaces', '-')}</td><td>{dev}</td><td>{c.get('explained', 0) * 100:.0f}%</td>"
+              f"<td>{html.escape(fnd)}</td></tr>")
         a("</table><p>De CAD-solid bestaat uit echte vlakken en cilinders, gefit op duizenden meetpunten: de ruis middelt "
           "weg. De mesh-versie staat altijd ook in <code>onderdelen/&lt;naam&gt;_mesh.step</code>. Wat de camera's niet "
           "zagen (onderkant, diepe gaten) is aangevuld en dus niet gemeten.</p></div>")
