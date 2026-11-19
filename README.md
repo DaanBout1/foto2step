@@ -220,9 +220,12 @@ geziene oppervlak (ongeziene delen apart gerapporteerd):
 | Gereedschapsblok 2° scheef op de vloer | geslaagd, 23/23 vlakken | 0,59 mm |
 | Blok met spiegel-dubbellaag (2,5 mm) | geslaagd, 6/6 vlakken | 0,06 mm |
 | Gereedschapsblok met spiegel-dubbellaag | geslaagd, 23/23 vlakken | 0,19 mm |
+| Echt blok nagebouwd (3 diepe groeven r 13, 2 lippen achter) | geslaagd, 0,5 mm én 0,7 mm ruis | 0,45 / 0,34 mm |
 
-Bij 1 mm ruis (twee keer de ruis van de echte scan) halen de eenvoudige delen het nog, de delen met groeven
-niet: de groeven worden dan niet meer als cilinder herkend. Beter fotograferen (mat spuiten) helpt hier het meest.
+Groeven, boringen en nokken langs de assen van het deel worden apart gezocht over álle punten (as vast op het
+assenstelsel, alleen middelpunt en straal gefit), zodat ze bij ~0,7 mm ruis niet meer als trap van vlakken
+eindigen. Bij 1 mm ruis halen de delen met groeven het nog niet. Glimmende vlakken geven in de echte scan
+strepen en dubbellagen; mat spuiten helpt daar het meest.
 
 Een gat waarvan de diepte niet te zien is blijft open waar de wanden gezien zijn; ongeziene delen worden apart gemeld.
 

@@ -63,6 +63,18 @@ def case_tool_block():
     return s
 
 
+def case_real_block():
+    """Measured from the user's real scan (test_01): 105 x 63 x 90 block, two lugs 17 wide sticking
+    out 14 mm at the back, and three deep round grooves along x on the front (r 13, 11 deep, 2 mm
+    ridges between them)."""
+    s = _box(0, 0, 0, 105, 63, 90)
+    for x0 in (33.0, 82.0):
+        s = _fuse(s, _box(x0, -14, 0, x0 + 17, 0.5, 90))
+    for z in (15.0, 42.0, 70.0):
+        s = _cut(s, _cyl((-1, 65.0, z), (1, 0, 0), 13.0, 107))
+    return s
+
+
 def case_bracket():
     """L-bracket with a boss and a through hole: plane + cylinder interplay."""
     s = _fuse(_box(0, 0, 0, 120, 50, 12), _box(0, 0, 0, 14, 50, 70))
@@ -122,7 +134,7 @@ def case_tilted_tool_block():
     return _tilted(case_tool_block(), 2.0)
 
 
-CASES = {"box": case_box, "tool_block": case_tool_block, "bracket": case_bracket,
+CASES = {"box": case_box, "tool_block": case_tool_block, "real_block": case_real_block, "bracket": case_bracket,
          "shallow": case_shallow, "zprofile": case_zprofile, "offframe": case_offframe,
          "tilted_tool_block": case_tilted_tool_block, "ghost_box": case_box, "ghost_tool_block": case_tool_block}
 

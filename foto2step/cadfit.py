@@ -1295,6 +1295,17 @@ def _tight_box(P, prims, noise_mm, margin):
                     nn = prim_normals(pr, S[near])
                     facing[np.where(near)[0][np.abs(nn @ d) > np.cos(np.radians(30))]] = True
             if facing.mean() > 0.2:
+                # the outermost fitted plane facing this way bounds the part: put the box just
+                # outside it, so noise outliers leave no room for slivers (thin ridge tips)
+                outer = [-(sgn * pr["d"] * np.sign(pr["n"][ax])) for pr in prims
+                         if pr["type"] == "plane" and not pr.get("hyp") and abs(pr["n"][ax]) > 0.999]
+                if outer:
+                    pos = max(outer)
+                    if np.mean(t > pos + 3 * noise_mm) < 1e-3 and q - 3 * noise_mm < pos:
+                        if sgn > 0:
+                            hi[ax] = min(hi[ax], pos + margin)
+                        else:
+                            lo[ax] = max(lo[ax], -(pos + margin))
                 continue
             e = _edge_position(t, noise_mm)
             if e is None:
@@ -1977,6 +1988,7 @@ def reconstruct(P, cams, noise_mm, floor_z=0.0, normals=None, voxel=None, log_fn
         Ns, dec = _normals(Ps)
         Pd, Nd = Ps, Ns  # Pd/Ps are the same set here
         prims, lab = _segment(Ps, Ns)
+    prims, lab = frame_cylinders(prims, lab, Ps, Ns, noise_mm, min_pts)
     prims, lab = prune_redundant(prims, lab, Ps, noise_mm, N=Ns)
     prims = refine_primitives(prims, lab, Ps, Ns, noise_mm, oriented=True)
     prims, lab = merge_similar(prims, lab, Ps, noise_mm)  # snapping can make planes coincide
@@ -2069,6 +2081,175 @@ def _same_surface(p, q, tol):
     return np.linalg.norm(w - (w @ p["a"]) * p["a"]) < tol
 
 
+def _frame_axes(prims):
+    axes = []
+    for p in prims:
+        if p["type"] == "plane" and p.get("snapped"):
+            if not any(abs(p["n"] @ a) > 0.999 for a in axes):
+                axes.append(_unit(p["n"]))
+    return axes
+
+
+def _verify_frame_cylinder(P, N, a, c, r, idx, r_cur, noise_mm, eps, link, min_pts, cos45):
+    """Refine a frame-axis cylinder hypothesis and test it. Returns (prim, won point indices, reason)."""
+    u, v = _perp_basis(a)
+    X = np.c_[P @ u, P @ v]
+    NX = np.c_[N @ u, N @ v]
+    across = np.abs(N @ a) < np.sin(np.radians(45))
+    for _ in range(3):
+        sol = least_squares(lambda x: np.linalg.norm(X[idx] - x[:2], axis=1) - x[2], np.r_[c, r],
+                            loss="soft_l1", f_scale=noise_mm)
+        c, r = sol.x[:2], float(abs(sol.x[2]))
+        if not (1.5 < r < 60.0):
+            return None, None, "radius"
+        rad = X - c
+        rn = np.linalg.norm(rad, axis=1)
+        d = np.abs(rn - r)
+        radial = np.abs(np.sum(NX * rad, 1) / np.maximum(rn, 1e-9))
+        idx = np.where((d < eps) & (radial > cos45) & across)[0]
+        if len(idx) < min_pts:
+            return None, None, "few"
+    idx = _largest_component(P, idx, link)
+    pr = {"type": "cylinder", "a": a.copy(), "p": c[0] * u + c[1] * v + a * float(np.median(P[idx] @ a)),
+          "r": r, "snapped": True, "frame": True}
+    d = np.abs(prim_dist(pr, P[idx]))
+    r_c = r_cur[idx]
+    win = idx[~np.isfinite(r_c) | (d < r_c)]
+    if len(win) < min_pts:
+        return None, None, "wins few"
+    # most of what it wins must have been badly explained: otherwise it is a rounded version of
+    # an edge or ridge that the existing faces already describe
+    rw = r_cur[win]
+    if np.mean(np.isfinite(rw) & (rw < eps)) > 0.5:
+        return None, None, "explained"
+    ang = np.arctan2(X[win, 1] - c[1], X[win, 0] - c[0])
+    span = _angular_span(ang)
+    if span < np.radians(120):  # groove/bore/boss; a 90 deg arc is two faces meeting at an edge
+        return None, None, "span"
+    a_s = np.mod(ang - ang.min(), 2 * np.pi)
+    hist, _ = np.histogram(a_s, bins=8, range=(0, max(span, 1e-6)))
+    if (hist > 0.25 * len(win) / 8).mean() < 0.75:
+        return None, None, "uneven"
+    # a real cylinder holds nearly all points of a wide band around its radius over its own arc and
+    # length (a staircase of planes, a square pocket or a big circle through a flat face does not)
+    hh = P[win] @ a
+    rn = np.linalg.norm(X - c, axis=1)
+    angs = np.arctan2(X[:, 1] - c[1], X[:, 0] - c[0])
+    in_arc = np.mod(angs - ang.min(), 2 * np.pi) <= span
+    band = (np.abs(rn - r) < 3 * eps) & (P @ a >= hh.min()) & (P @ a <= hh.max()) & across & in_arc
+    frac = (np.abs(rn[band] - r) < eps).mean() if band.any() else 0.0
+    if frac < 0.7:
+        return None, None, f"band {frac:.2f}"
+    rms = float(np.sqrt(np.mean(prim_dist(pr, P[win]) ** 2)))
+    if rms > 1.5 * noise_mm:
+        return None, None, f"rms {rms:.2f}"
+    signed_cos(pr, P[win], N[win])
+    pr.update(rms=rms, n_pts=int(len(win)))
+    return pr, win, "ok"
+
+
+def frame_cylinders(prims, labels, P, N, noise_mm, min_pts, max_new=12, n_hyp=500, seed=0):
+    """Grooves, bores and bosses along the part's own axes, searched over ALL points.
+
+    At ~0.7 mm noise the PCA normals over a 5 mm neighbourhood smear a groove of r = 8 mm, so the
+    normal-guided RANSAC misses it and the groove ends up as a staircase of parallel planes or one
+    slanted plane. Here the axis is fixed to a frame axis (machined parts: grooves and bores run along
+    the part's edges), so only centre and radius are fitted, from 3 positions; normals only need to
+    agree loosely. A candidate is scored by how much better it explains points than their current
+    surface; the points it wins move to the cylinder, and planes left without points are pruned."""
+    axes = _frame_axes(prims)
+    if not axes:
+        return prims, labels
+    rng = np.random.default_rng(seed)
+    eps = max(2.0 * noise_mm, 0.8)
+    link = 3.0 * max(noise_mm, 0.5) + 1.5
+    cos45 = np.cos(np.radians(45))
+    labels = labels.copy()
+    prims = list(prims)
+    tree = cKDTree(P)
+
+    def current_residual():
+        r = np.full(len(P), np.inf)
+        for k, p in enumerate(prims):
+            m = labels == k
+            if m.any():
+                r[m] = np.abs(prim_dist(p, P[m]))
+        return r
+
+    n_new = 0
+    frame_cylinders.debug = []
+    rejected = []  # (axis, centre, r) verified and rejected: not tried again
+    for _round in range(max_new):
+        r_cur = current_residual()
+        hyps = []
+        for a in axes:
+            u, v = _perp_basis(a)
+            X = np.c_[P @ u, P @ v]
+            Na = N @ a
+            cand = np.where(np.abs(Na) < np.sin(np.radians(45)))[0]
+            if len(cand) < min_pts:
+                continue
+            # seeds preferably where the current model explains the points badly
+            w = 1.0 + np.minimum(np.nan_to_num(r_cur[cand], posinf=5 * noise_mm) / noise_mm, 5.0)
+            w = w / w.sum()
+            NX = np.c_[N[cand] @ u, N[cand] @ v]
+            for _ in range(n_hyp):
+                i = cand[rng.choice(len(cand), p=w)]
+                nb = tree.query_ball_point(P[i], 12.0)
+                nb = np.array([j for j in nb if abs(Na[j]) < np.sin(np.radians(45)) and j != i])
+                if len(nb) < 2:
+                    continue
+                j, k = rng.choice(nb, 2, replace=False)
+                A_ = 2 * np.array([X[j] - X[i], X[k] - X[i]])
+                if abs(np.linalg.det(A_)) < 1e-3:
+                    continue
+                c = np.linalg.solve(A_, [X[j] @ X[j] - X[i] @ X[i], X[k] @ X[k] - X[i] @ X[i]])
+                r = float(np.linalg.norm(X[i] - c))
+                if not (1.5 < r < 60.0):
+                    continue
+                if any(abs(a @ ra) > 0.999 and np.linalg.norm(c - rc_) < eps and abs(r - rr_) < eps
+                       for ra, rc_, rr_ in rejected):
+                    continue
+                rad = X[cand] - c
+                rn = np.linalg.norm(rad, axis=1)
+                d = np.abs(rn - r)
+                ok = d < eps
+                if ok.sum() < min_pts:
+                    continue
+                radial = np.abs(np.sum(NX[ok] * rad[ok], 1) / np.maximum(rn[ok], 1e-9))
+                okk = np.where(ok)[0][radial > cos45]
+                rc = r_cur[cand[okk]]
+                # only a clear improvement counts: on a flat face the residuals are noise anyway,
+                # and a big circle grazing it would collect "gain" from that noise alone
+                gain = np.where(np.isfinite(rc), np.clip((rc - d[okk] - noise_mm) / noise_mm, 0, 1), 1.0).sum()
+                if gain >= 0.5 * min_pts:
+                    hyps.append((gain, a, c, r, cand[okk]))
+        # verify the best few distinct hypotheses; accept the first that is a real cylinder
+        hyps.sort(key=lambda h: -h[0])
+        tried, accepted = [], False
+        for gain, a, c, r, idx in hyps:
+            if len(tried) >= 120:
+                break
+            if any(abs(a @ ta) > 0.999 and np.linalg.norm(c - tc) < eps and abs(r - tr) < eps for ta, tc, tr in tried):
+                continue
+            tried.append((a, c, r))
+            pr, win, why = _verify_frame_cylinder(P, N, a, c, r, idx, r_cur, noise_mm, eps, link, min_pts, cos45)
+            frame_cylinders.debug.append((round(float(gain), 1), np.round(a, 2), np.round(c, 1), round(r, 2), why))
+            if pr is None or any(_same_surface(pr, q, eps) for q in prims):
+                rejected.append((a, c, r))
+                continue
+            labels[win] = len(prims)
+            prims.append(pr)
+            n_new += 1
+            accepted = True
+            break
+        if not accepted:
+            break
+    if n_new:
+        log(f"  CAD: {n_new} groef/boring/naaf langs de assen van het deel gevonden")
+    return prims, labels
+
+
 def split_false_chamfers(prims, labels, P, N, noise_mm):
     """A small step (a 3 x 3 mm notch along an edge) at ~0.5 mm noise is also fitted by one slanted
     plane across it (a false chamfer). For a plane that is not on the part's frame but lies along a
@@ -2085,18 +2266,28 @@ def split_false_chamfers(prims, labels, P, N, noise_mm):
     labels = labels.copy()
     n_split = 0
     for k, p in enumerate(prims):
-        if p["type"] != "plane" or p.get("snapped"):
-            continue
         idx = np.where(labels == k)[0]
         if len(idx) < 60:
             continue
-        along = [a for a in axes if abs(a @ p["n"]) < np.sin(np.radians(2))]
+        if p["type"] == "plane":
+            if p.get("snapped"):
+                continue
+            along = [a for a in axes if abs(a @ p["n"]) < np.sin(np.radians(2))]
+        else:
+            # a small arc along a frame axis can be a false fillet on a sharp edge: the same test
+            along = [a for a in axes if abs(a @ p["a"]) > np.cos(np.radians(2))]
+            if len(along) == 1:
+                uu, vv = _perp_basis(p["a"])
+                w_ = P[idx] - p["p"]
+                if _angular_span(np.arctan2(w_ @ vv, w_ @ uu)) >= np.radians(120):
+                    continue
         if len(along) != 1:
             continue
         a1, a2 = [a for a in axes if abs(a @ along[0]) < 0.5][:2]
         Q = P[idx]
         u, v = Q @ a1, Q @ a2
         rms_plane = float(np.sqrt(np.mean(prim_dist(p, Q) ** 2)))
+        is_cyl = p["type"] == "cylinder"
         # the neighbouring frame faces (top, back wall) also hold some of these points
         d0 = np.full(len(Q), np.inf)
         for q in prims:
@@ -2115,8 +2306,13 @@ def split_false_chamfers(prims, labels, P, N, noise_mm):
         own = np.minimum(d1, d2) <= d0  # points that need the new arms
         on1, on2 = own & (d1 < d2), own & (d1 >= d2)
         # a real chamfer fits its plane at the noise level; a false one leaves the step's variance
-        if not (rms_plane > 1.15 * noise_mm and rms < 0.92 * rms_plane
-                and min(on1.sum(), on2.sum()) > 0.15 * own.sum()):
+        if is_cyl:
+            # the edge model (2 planes) has no curvature to spare: as good a fit is enough
+            accept = rms <= 1.0 * rms_plane and min(on1.sum(), on2.sum()) > 0.15 * own.sum()
+        else:
+            accept = (rms_plane > 1.15 * noise_mm and rms < 0.92 * rms_plane
+                      and min(on1.sum(), on2.sum()) > 0.15 * own.sum())
+        if not accept:
             continue
         # refine: reassign to the nearer arm (or neighbour face) and re-estimate, a few times; the
         # grid optimum is biased by the ambiguous points in the inner corner
@@ -2316,6 +2512,7 @@ def boundary_hypotheses(prims, labels, P, N, noise_mm, max_new=40):
     if len(axes) < 2:
         return []
     existing = [(p["n"], -p["d"]) for p in prims if p["type"] == "plane"]
+    cyls = [p for p in prims if p["type"] == "cylinder"]
     tree = cKDTree(P)
     out = []
     for k, p in enumerate(prims):
@@ -2330,6 +2527,11 @@ def boundary_hypotheses(prims, labels, P, N, noise_mm, max_new=40):
             t = Q @ e
             for pos in (np.percentile(t, 0.5), np.percentile(t, 99.5)):
                 if any(abs(n @ e) > 0.999 and abs(off * np.sign(n @ e) - pos) < 1.5 for n, off in existing):
+                    continue
+                # the region may end on a known curved surface (counterbore floor -> its bore wall)
+                E = Q[np.abs(t - pos) < 2 * eps]
+                if len(E) and cyls and np.mean(np.min(np.stack([np.abs(prim_dist(c_, E)) for c_ in cyls], 1), 1)
+                                               < 1.5 * eps) > 0.5:
                     continue
                 # refine on points near the candidate wall with a compatible normal
                 near = np.asarray(tree.query_ball_point(Q[np.argmin(np.abs(t - pos))], 40.0))
@@ -2525,13 +2727,25 @@ def roundtrip_ok(path, shape, vol_tol=0.005, ref_volume=None):
     from OCP.BRepGProp import BRepGProp
     from OCP.Bnd import Bnd_Box
     from OCP.BRepBndLib import BRepBndLib
+    roundtrip_ok.healed = False
     r = STEPControl_Reader()
     if r.ReadFile(str(path)) != 1:
         return False, "niet leesbaar"
     r.TransferRoots()
     rs = r.OneShape()
     if not BRepCheck_Analyzer(rs).IsValid():
-        return False, "teruggelezen STEP ongeldig"
+        # a few faces (of thousands) can come back with a wire the checker rejects; CAD importers heal
+        # that on import. Accept only if the standard healing makes it valid and every other check
+        # (one solid, closed, same faces, same volume) still passes.
+        from OCP.ShapeFix import ShapeFix_Shape
+        fx = ShapeFix_Shape(rs)
+        fx.SetPrecision(1e-4)
+        fx.SetMaxTolerance(1e-2)
+        fx.Perform()
+        rs = fx.Shape()
+        if not BRepCheck_Analyzer(rs).IsValid():
+            return False, "teruggelezen STEP ongeldig"
+        roundtrip_ok.healed = True
     from OCP.TopExp import TopExp_Explorer
     from OCP.TopAbs import TopAbs_SOLID, TopAbs_SHELL, TopAbs_WIRE
     from OCP.ShapeAnalysis import ShapeAnalysis_FreeBounds
@@ -2579,6 +2793,8 @@ def export_solid(path, name, shape, rgb, ref_volume=None):
     from OCP.BRepBuilderAPI import BRepBuilderAPI_NurbsConvert
     write_named_step(path, [(name, shape, rgb)])
     ok, why = roundtrip_ok(path, shape, ref_volume=ref_volume)
+    if ok and roundtrip_ok.healed:
+        return True, "analytisch (bij inlezen standaard hersteld)", shape
     if ok:
         return True, "analytisch", shape
     sf = ShapeFix_Shape(shape)
