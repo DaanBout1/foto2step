@@ -230,7 +230,10 @@ def simulate_scan(shape, noise, density=1.6, seed=0, ghost=False):
 
 # ---------------------------------------------------------------- grading
 
-def _seen(S, V, T, cams):
+def _seen(S, V, T, cams, Nrm=None):
+    """Surface the scan can contain: >= 2 cameras with a free line of sight, and (as in the scan
+    simulation) not more grazing than ~80 deg. A face seen only edge-on (the inside of a 1.5 mm slot,
+    a long bore from its ends) gives no points and cannot be judged."""
     import open3d as o3d
     sc = o3d.t.geometry.RaycastingScene()
     sc.add_triangles(o3d.core.Tensor(V.astype(np.float32)), o3d.core.Tensor(T.astype(np.uint32)))
@@ -241,7 +244,10 @@ def _seen(S, V, T, cams):
         O = S + 0.05 * D / L[:, None]
         rays = np.c_[O, D / L[:, None]].astype(np.float32)
         hit = sc.cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy()
-        cnt += hit >= L - 0.1
+        ok = hit >= L - 0.1
+        if Nrm is not None:
+            ok &= np.abs(np.einsum("nd,nd->n", D, Nrm)) > 0.17 * L
+        cnt += ok
     return cnt >= 2
 
 
@@ -265,10 +271,12 @@ def grade(result, truth, scan_P, cams):
     Vt, Tt = cadfit._mesh_of_shape(truth, defl=0.05)
     Vr, Tr = cadfit._mesh_of_shape(result, defl=0.05)
     St = _area_samples(Vt, Tt, 0.5)
-    St = St[St[:, 2] > 0.5]
+    Nt = _area_samples.normals
+    keep_t = St[:, 2] > 0.5
+    St, Nt = St[keep_t], Nt[keep_t]
     Sr = _area_samples(Vr, Tr, 0.5)
     Sr = Sr[Sr[:, 2] > 0.5]
-    seen = _seen(St, Vt, Tt, cams)
+    seen = _seen(St, Vt, Tt, cams, Nt)
     d_tr = _dist_to_mesh(St, Vr, Tr)
     d_rt = _dist_to_mesh(Sr, Vt, Tt)
     # result samples whose closest truth point is unseen are not judged either
@@ -299,7 +307,10 @@ def _area_samples(V, T, step):
     idx = np.repeat(np.arange(len(T)), k)
     r1, r2 = rng.random(len(idx)), rng.random(len(idx))
     s1 = np.sqrt(r1)
-    return (1 - s1)[:, None] * A[idx] + (s1 * (1 - r2))[:, None] * B[idx] + (s1 * r2)[:, None] * C[idx]
+    S = (1 - s1)[:, None] * A[idx] + (s1 * (1 - r2))[:, None] * B[idx] + (s1 * r2)[:, None] * C[idx]
+    nt = np.cross(B - A, C - A)
+    _area_samples.normals = (nt / np.maximum(np.linalg.norm(nt, axis=1, keepdims=True), 1e-12))[idx]
+    return S
 
 
 def run(noise=0.5, names=None, out_dir=Path("cad_gauntlet_out"), seeds=(0,)):

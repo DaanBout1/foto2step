@@ -1438,7 +1438,7 @@ def _visibility_test(P, N, cams, min_cams=2, max_cams=64, splat_factor=2.0, igno
     scene.add_triangles(o3d.core.Tensor(V.astype(np.float32)), o3d.core.Tensor(F.astype(np.uint32)))
     off = float(ignore_mm)
 
-    def vis(S, chunk=20000):
+    def vis(S, nrm=None, chunk=20000, max_angle=75.0):
         S = np.asarray(S, float)
         out = np.zeros(len(S), bool)
         for i in range(0, len(S), chunk):
@@ -1446,10 +1446,12 @@ def _visibility_test(P, N, cams, min_cams=2, max_cams=64, splat_factor=2.0, igno
             D = C[None] - Q[:, None]
             L = np.linalg.norm(D, axis=2)
             U = D / L[..., None]
+            facing = (np.abs(np.einsum("ijk,ik->ij", U, np.asarray(nrm[i:i + chunk], float))) >
+                      np.cos(np.radians(max_angle))) if nrm is not None else np.ones(U.shape[:2], bool)
             O = Q[:, None] + off * U
             rays = np.concatenate([O.reshape(-1, 3), U.reshape(-1, 3)], 1).astype(np.float32)
             hit = scene.cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy().reshape(len(Q), len(C))
-            out[i:i + chunk] = (hit >= L - off - 0.5).sum(1) >= min_cams
+            out[i:i + chunk] = ((hit >= L - off - 0.5) & facing).sum(1) >= min_cams
         return out
     return vis
 
@@ -1465,7 +1467,8 @@ def _graphcut_cells(cells, frac, vol, lam, P=None, eps=1.0, step=1.0, w_unsup=4.
     import networkx as nx
     owner = {}
     farea = {}
-    fsup = {}
+    fsup = {}   # 1 - fraction that is unsupported although a camera could have seen it (penalty)
+    fdata = {}  # fraction actually supported by points (evidence for orientation)
     face_pts = {}
     tree = cKDTree(P) if P is not None else None
     for i, c in enumerate(cells):
@@ -1485,10 +1488,21 @@ def _graphcut_cells(cells, frac, vol, lam, P=None, eps=1.0, step=1.0, w_unsup=4.
                 elif tree is not None and len(S):
                     d, _ = tree.query(S, distance_upper_bound=eps)
                     uns = ~np.isfinite(d)
+                    fdata[h] = float(1.0 - uns.mean())  # real support by measured points
                     if vis is not None and uns.any():
                         # only a face the cameras could have seen is suspicious when it has no
-                        # points; the deep part of a hole is hidden by its own rim
-                        uns[np.where(uns)[0][~vis(S[uns])]] = False
+                        # points; the deep part of a hole is hidden by its own rim, and a camera
+                        # looking along a bore sees its wall only at a grazing angle (no points)
+                        nrm_s = None
+                        if prims is not None:
+                            xm = S[len(S) // 2][None]
+                            dk = [abs(prim_dist(pr, xm)[0]) for pr in prims]
+                            kk = int(np.argmin(dk))
+                            if dk[kk] < 0.05:
+                                raw = dict(prims[kk])
+                                raw["s"] = 1.0
+                                nrm_s = prim_normals(raw, S[uns])
+                        uns[np.where(uns)[0][~vis(S[uns], nrm_s)]] = False
                     fsup[h] = float(1.0 - uns.mean())
                 else:
                     fsup[h] = 1.0
@@ -1504,7 +1518,7 @@ def _graphcut_cells(cells, frac, vol, lam, P=None, eps=1.0, step=1.0, w_unsup=4.
         from OCP.gp import gp_Pnt
         from OCP.TopAbs import TopAbs_IN
         for h, own in owner.items():
-            if len(own) != 2 or fsup.get(h, 0) < 0.3:
+            if len(own) != 2 or fdata.get(h, fsup.get(h, 0)) < 0.3:
                 continue
             S = face_pts.get(h)
             if S is None or len(S) == 0:
@@ -1518,7 +1532,7 @@ def _graphcut_cells(cells, frac, vol, lam, P=None, eps=1.0, step=1.0, w_unsup=4.
             q = x + 0.05 * nrm
             cls = BRepClass3d_SolidClassifier(cells[own[0]], gp_Pnt(*map(float, q)), 1e-6)
             front, back = (own[0], own[1]) if cls.State() == TopAbs_IN else (own[1], own[0])
-            w = w_orient * fsup[h] * farea[h]
+            w = w_orient * fdata.get(h, fsup[h]) * farea[h]  # only measured surface is evidence
             unary_in[front] += w
             unary_out[back] += w
     for h, own in owner.items():
@@ -2033,6 +2047,11 @@ def reconstruct(P, cams, noise_mm, floor_z=0.0, normals=None, voxel=None, log_fn
     reconstruct.last = dict(prims=prims, lab=lab, P=Ps, N=Ns, hyp=hyp)
     prims = dedupe_surfaces(prims + hyp, noise_mm=noise_mm)
     occ = hoppe_occupancy(Pd, Nd, floor_z=floor_z, floor_plane=floor_plane)
+    blo, bhi = Pd.min(0), Pd.max(0)
+    if floor_z is not None:
+        blo[2] = floor_z
+    caps, occ = blind_hole_caps(prims, Pd, Nd, occ, noise_mm, blo, bhi, log_fn=log_fn)
+    prims = prims + caps
     shape, rep = cell_solid(prims, Pd, occ, floor_z=floor_z, noise_mm=noise_mm, smooth=smooth,
                             floor_plane=floor_plane, N=Nd, cams=cams)
     shape = clean_solid(shape)
@@ -2040,7 +2059,7 @@ def reconstruct(P, cams, noise_mm, floor_z=0.0, normals=None, voxel=None, log_fn
     # tiny faces. Drop those and solve again on the remaining surfaces.
     a_min = max(30.0, 10 * (2.5 * noise_mm) ** 2)
     used = _surface_areas(shape, prims)
-    drop = [k for k in range(len(prims)) if used[k] < a_min]
+    drop = [k for k in range(len(prims)) if used[k] < a_min and not prims[k].get("cap")]  # a cap is small by nature
     if drop and len(drop) < len(prims):
         keep_p = [p for k, p in enumerate(prims) if k not in drop]
         log_fn(f"  CAD: {len(drop)} oppervlak(ken) zonder wezenlijke bijdrage weggelaten, opnieuw opgelost")
@@ -2350,6 +2369,78 @@ def split_false_chamfers(prims, labels, P, N, noise_mm):
     if n_split:
         log(f"  CAD: {n_split} schuin vlak(ken) vervangen door een kleine trede")
     return out, labels
+
+
+def blind_hole_caps(prims, P, N, occ, noise_mm, box_lo, box_hi, max_depth_ratio=6.0, log_fn=log):
+    """Holes whose bottom no camera saw.
+
+    A hole is measured only as deep as its wall was seen; below that nothing is known. If the hole
+    would have to run on for more than max_depth_ratio x its diameter to come out on the other side
+    of the part, it is taken as a blind hole that ends where its wall was last seen (a 5 mm hole is
+    not drilled through 90 mm of steel); a shorter one is left open (through hole).
+    Returns (cap planes, occupancy function with the unseen part of blind holes set to material)."""
+    eps = max(2.0 * noise_mm, 0.8)
+    caps, zones, opens = [], [], []
+    for p in prims:
+        if p["type"] != "cylinder" or p.get("s", 1.0) > 0 or p["r"] > 15.0:
+            continue
+        a, p0, r = _unit(p["a"]), p["p"], p["r"]
+        q = P - p0
+        t = q @ a
+        rad = q - np.outer(t, a)
+        rn = np.linalg.norm(rad, axis=1)
+        mem = (np.abs(rn - r) < eps) & (np.sum(N * rad, 1) / np.maximum(rn, 1e-9) < -np.cos(np.radians(45)))
+        if mem.sum() < 30:
+            continue
+        t0, t1 = np.percentile(t[mem], [0.5, 99.5])
+        u, v = _perp_basis(a)
+        # wall seen at both ends with an unseen stretch between (a long bore seen into from both
+        # sides): it runs through, so the stretch between is open
+        ts = np.sort(t[mem])
+        gaps = np.diff(ts)
+        if len(gaps) and gaps.max() > max(5.0, 2 * r):
+            opens.append((a, p0, r, t0, t1))
+            continue
+        for end, sgn in ((t1, 1.0), (t0, -1.0)):
+            # deep side: just past this end, beside the hole, there is material
+            side = p0 + (end + sgn * 2.0) * a + (r + 2.5) * np.array([u, -u, v, -v])
+            if occ(side).mean() < 0.75:
+                continue  # this end opens to the outside
+            # how far would the hole have to run to come out of the part?
+            L = 0.0
+            for step in np.arange(1.0, 400.0, 1.0):
+                x = p0 + (end + sgn * step) * a
+                if np.any(x < box_lo) or np.any(x > box_hi):
+                    break
+                ring = x + (r + 2.5) * np.array([u, -u, v, -v])
+                if occ(ring).mean() < 0.5:
+                    break
+                L = step
+            if L > max_depth_ratio * 2 * r:
+                tc = end + sgn * 0.3
+                caps.append({"type": "plane", "n": a * sgn, "d": -float((p0 + tc * a) @ (a * sgn)), "hyp": True,
+                             "snapped": True, "rms": 0.0, "n_pts": 0, "cap": True})
+                zones.append((a, p0, r, tc, sgn))
+    if caps:
+        log_fn(f"  CAD: {len(caps)} blind(e) gat(en): bodem niet gezien, gat eindigt waar de wand nog gezien is")
+
+    if opens:
+        log_fn(f"  CAD: {len(opens)} doorgaande boring(en): van beide kanten gezien, midden open")
+
+    def occ2(Q):
+        o = occ(Q)
+        for a, p0, r, tc, sgn in zones:
+            q = Q - p0
+            t = q @ a
+            rn = np.linalg.norm(q - np.outer(t, a), axis=1)
+            o = o | ((rn < r + 0.5) & ((t - tc) * sgn > 0))
+        for a, p0, r, t0, t1 in opens:
+            q = Q - p0
+            t = q @ a
+            rn = np.linalg.norm(q - np.outer(t, a), axis=1)
+            o = o & ~((rn < r - 0.3) & (t > t0) & (t < t1))
+        return o
+    return caps, (occ2 if (zones or opens) else occ)
 
 
 def harmonize_normals(prims, labels, P, N, noise_mm):

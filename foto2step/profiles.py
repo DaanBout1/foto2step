@@ -26,7 +26,8 @@ from .log import log
 
 # Let a clear profile overrule the general segmentation along its direction. Off by default: in the
 # gauntlet it fixed the T-slot rail but cost detail on prismatic parts (bracket, shallow steps).
-AUTHORITY = False
+import os as _os
+AUTHORITY = _os.environ.get("FOTO2STEP_PROFILE_AUTHORITY", "0") == "1"
 
 
 def _raster(X, cell, lo, shape):
